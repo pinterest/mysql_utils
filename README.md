@@ -151,7 +151,7 @@ used for gating cron jobs.
   - **purge_mysql_backups.py**
 This script purges backup files on local disk, but takes no action on backups
 in S3. 
-  - **retirement_queue.py*
+  - **retirement_queue.py**
 This script ensures that a server which is no longer in service discovery
 is no longer in use and then terminates the instance.
   - **schema_verifier.py**
@@ -159,12 +159,15 @@ This script ensures that schema is in sync across sharded data sets.
 
 ## Some examples
 
-# Find the pinlater test servers
+Find the pinlater test servers
+```
 $ ./mysql_replica_mappings.py | grep pinlatertest
 pinlatertestdb002               master      pinlatertestdb-2-3:3306
 pinlatertestdb002               slave       pinlatertestdb-2-4:3306
+```
 
-# Promote the slave to master
+Promote the slave to master
+```
 $ ./mysql_failover.py pinlatertestdb-2-3
 I18:15:10 [__main__] Master to demote is pinlatertestdb-2-3:3306
 I18:15:10 [__main__] Replica set is detected as pinlatertestdb002
@@ -226,8 +229,10 @@ I18:15:21 [lib.mysql_lib] RESET SLAVE ALL
 I18:15:21 [__main__] Releasing promotion lock
 I18:15:21 [__main__] UPDATE mysqlops.promotion_locks SET lock_active = NULL AND released = NOW() WHERE lock_identifier = '48f8ee80-d97e-47b4-bf2a-75fd5d985b20'
 I18:15:21 [__main__] Failover complete
+```
 
-# Replace the old master/new slave
+Replace the old master/new slave
+```
 $ ./launch_replacement_db_host.py pinlatertestdb-2-3 --reason kicks_and_giggles
 I18:19:28 [__main__] Trying to launch a replacement for host pinlatertestdb-2-3 which is part of replica set is pinlatertestdb002
 I18:19:28 [__main__] Data from cmdb: {u'config.instance_type': u'i2.2xlarge', u'region': u'us-east-1', u'cloud.aws.vpc_id': u'REDACTED', u'cloud.aws.subnet_id': u'REDACED', u'location': u'us-east-1a', u'id': u'REDACTED', u'security_group_ids': u'REDACTED', u'config.name': u'pinlatertestdb-2-3', u'security_groups': u'REDACTED'}
@@ -243,10 +248,12 @@ I18:19:29 [launch_amazon_mysql_server] Requested dry_run = False
 I18:19:29 [launch_amazon_mysql_server] Requested skip_name_check = True
 I18:19:29 [launch_amazon_mysql_server] Will use subnet "REDACTED" in "REDACTED" based upon security group REDACTED and availibility zone us-east-1a
 I18:19:29 [launch_amazon_mysql_server] Config for new server:
-# Tons of Pinterest stuff redacted here
-I18:19:30 [launch_amazon_mysql_server] Launched instance i-3f49498e
+..Tons of Pinterest stuff redacted here..
+I18:19:30 [launch_amazon_mysql_server] Launched instance i-1231234
+```
 
-# Check replication on the old master/new slave
+ Check replication on the old master/new slave
+```
 ./check_mysql_replication.py pinlatertestdb-2-3
 Heartbeat_seconds_behind: 0
 Slave_IO_Running: Yes
@@ -255,12 +262,14 @@ IO_lag_binlogs: 0
 Slave_SQL_Running: Yes
 SQL_lag_bytes: 2068
 SQL_lag_binlogs: 0
+```
 
-# Check grants on the old master/new slave
+Check grants on the old master/new slave
+```
 $ ./mysql_grants.py -i pinlatertestdb-2-3 -a check
 $ echo $?
 0
-
+```
 
 ## Not a Panacea
 These tools are tightly integrated into our service discovery mechanism and

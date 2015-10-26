@@ -1,0 +1,8 @@
+host=127.0.0.1
+busy-time={busy_time}
+interval=1
+kill
+victims=all
+user={username}
+password={password}
+ignore-user=({ignore_users})

@@ -1,0 +1,3 @@
+[mysqld3306]
+loose_rpl_semi_sync_master_enabled = 1
+max_connections = 10000

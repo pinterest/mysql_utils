@@ -1,0 +1,4 @@
+[mysqld3306]
+thread_handling = pool-of-threads
+thread_pool_size = 36
+max_connections = 15000

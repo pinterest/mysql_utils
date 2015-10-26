@@ -1,0 +1,3 @@
+[mysqld3306]
+default_storage_engine=InnoDB
+remove_enforce_storage_engine=InnoDB

@@ -1,0 +1,75 @@
+[mysqld]
+innodb_data_file_path = ibdata1:10M;ibdata2:10M:autoextend
+
+[mysqld3306]
+# Paths
+basedir = /usr
+datadir = __ROOT__/mysql/3306/data/
+general_log_file = __ROOT__/mysql/3306/logs/general.log
+log_bin = __ROOT__/mysql/3306/binlogs/__HOSTNAME__-bin
+log_error = __ROOT__/mysql/3306/logs/mysqld.err
+pid_file = /var/run/mysqld/mysqld_3306.pid
+slow_query_log_file = __ROOT__/mysql/3306/logs/mysql-slow.log
+socket = /var/run/mysqld/mysqld_3306.sock
+tmpdir = __ROOT__/mysql/3306/tmp/
+
+# InnoDB
+innodb_adaptive_hash_index = OFF
+innodb_buffer_pool_size = 1000M
+innodb_data_file_path = ibdata1:10M;ibdata2:10M:autoextend
+innodb_file_format = Barracuda
+innodb_flush_log_at_trx_commit = 1
+innodb_flush_method = O_DIRECT
+innodb_lock_wait_timeout = 25
+innodb_log_block_size = 4096
+innodb_io_capacity = 200
+innodb_log_buffer_size = 32M
+innodb_log_file_size = 1G
+innodb_max_dirty_pages_pct = 75
+innodb_open_files = 65535
+innodb_purge_threads = 4
+innodb_read_io_threads = 8
+innodb_write_io_threads = 8
+
+# Replication
+binlog_format = STATEMENT
+binlog_cache_size = 1M
+expire_logs_days = 7
+log_slave_updates = ON
+max_binlog_size = 100M
+report_host = __HOSTNAME__
+server_id = 657952340
+relay_log_recovery = ON
+slave_net_timeout = 300
+sync_binlog = 1
+
+# Connections
+user = mysql
+port = 3306
+max_connections = 4500
+max_connect_errors = 1844674407370954752
+
+# Logging
+loose_query_response_time_range_base  = 2
+loose_query_response_time_stats = ON
+loose_log_slow_verbosity = full
+loose_slow_query_log_use_global_control = all
+slow_query_log = 1
+long_query_time = 0.1
+userstat = on
+log_warnings_suppress='1592'
+
+# Miscellaneous
+performance_schema = off
+enforce_storage_engine=InnoDB
+query_cache_size = 0
+skip_name_resolve = 1
+max_allowed_packet = 32M
+table_open_cache = 32768
+table_definition_cache = 8192
+max_heap_table_size = 128M
+tmp_table_size = 128M
+wait_timeout = 600
+
+[client]
+socket = /var/run/mysqld/mysqld_3306.sock

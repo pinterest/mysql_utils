@@ -1,0 +1,6 @@
+defaults-file={defaults_file}
+host=127.0.0.1
+pass={password}
+user={username}
+database={metadata_db}
+replace

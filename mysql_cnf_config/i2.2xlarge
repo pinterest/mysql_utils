@@ -1,0 +1,6 @@
+[mysqld3306]
+innodb_io_capacity = 5000
+innodb_io_capacity_max = 10000
+innodb_buffer_pool_size = 30000M
+innodb_log_file_size = 2G
+innodb_lru_scan_depth = 2048

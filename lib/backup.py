@@ -1,24 +1,45 @@
 import boto
+from boto.utils import get_instance_metadata
 import os
 import re
 import resource
 import subprocess
+import sys
 import time
 import urllib
-from boto.utils import get_instance_metadata
 
 import mysql_lib
 import host_utils
 from lib import environment_specific
 
 
+BACKUP_FILE = 'mysql-{hostname}-{port}-{timestamp}.{backup_type}'
 BACKUP_LOCK_FILE = '/tmp/backup_mysql.lock'
+BACKUP_TYPE_LOGICAL = 'sql.gz'
+BACKUP_TYPE_XBSTREAM = 'xbstream'
+BACKUP_TYPES = set([BACKUP_TYPE_LOGICAL, BACKUP_TYPE_XBSTREAM])
+INNOBACKUPEX = '/usr/bin/innobackupex'
+INNOBACKUP_OK = 'innobackupex: completed OK!'
+MYSQLDUMP = '/usr/bin/mysqldump'
+MYSQLDUMP_CMD = ' '.join((MYSQLDUMP,
+                          '--master-data',
+                          '--single-transaction',
+                          '--events',
+                          '--all-databases',
+                          '--routines',
+                          '--user={dump_user}',
+                          '--password={dump_pass}',
+                          '--host={host}',
+                          '--port={port}'))
+PIGZ = '/usr/bin/pigz -p 2'
 PV = '/usr/bin/pv -peafbt'
 SSH_OPTIONS = '-q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
 SSH_AUTH = '-i /home/dbutil/.ssh/id_rsa dbutil'
 S3_SCRIPT = '/usr/local/bin/gof3r'
 TEMP_DIR = '/backup/tmp/xtrabackup'
 TARGET_DIR = '/backup/mysql'
+USER_ROLE_MYSQLDUMP = 'mysqldump'
+USER_ROLE_XTRABACKUP = 'xtrabackup'
 XB_RESTORE_STATUS = ("CREATE TABLE IF NOT EXISTS test.xb_restore_status ("
                      "id                INT UNSIGNED NOT NULL AUTO_INCREMENT, "
                      "restore_source    VARCHAR(64), "
@@ -37,15 +58,24 @@ XB_RESTORE_STATUS = ("CREATE TABLE IF NOT EXISTS test.xb_restore_status ("
                      "PRIMARY KEY(id), "
                      "INDEX (restore_type, started_at), "
                      "INDEX (restore_type, restore_status, started_at) )")
-XTRA_DEFAULTS = ' '.join(('--slave-info',
-                          '--safe-slave-backup',
-                          '--parallel=8',
-                          '--stream=xbstream',
-                          '--no-timestamp',
-                          '--compress',
-                          '--compress-threads=8',
-                          '--kill-long-queries-timeout=10'))
-XBSTREAM_SUFFIX = '.xbstream'
+XTRABACKUP_CMD = ' '.join(('/bin/bash -c "',
+                           INNOBACKUPEX,
+                           '{datadir}',
+                           '--slave-info',
+                           '--safe-slave-backup',
+                           '--parallel=8',
+                           '--stream=xbstream',
+                           '--no-timestamp',
+                           '--compress',
+                           '--compress-threads=8',
+                           '--kill-long-queries-timeout=10',
+                           '--user={xtra_user}',
+                           '--password={xtra_pass}',
+                           '--defaults-file={cnf}',
+                           '--defaults-group={cnf_group}',
+                           '--port={port}',
+                           '2>{tmp_log}',
+                           '>{tmp_xtra_path}"'))
 MINIMUM_VALID_BACKUP_SIZE_BYTES = 1024 * 1024
 
 log = environment_specific.setup_logging_defaults(__name__)
@@ -161,11 +191,62 @@ def remove_backups(backup_path,
             os.remove(log_file)
 
 
-def xtrabackup_instance(instance):
+def logical_backup_instance(instance, timestamp):
+    """ Take a compressed mysqldump backup
+
+    Args:
+    instance - A hostaddr instance
+    timestamp - A timestamp which will be used to create the backup filename
+
+    Returns:
+    A string of the path to the finished backup
+    """
+    (temp_path, target_path) = get_paths(port=instance.port)
+    dump_file = BACKUP_FILE.format(hostname=instance.hostname,
+                                   port=instance.port,
+                                   timestamp=time.strftime('%Y-%m-%d-%H:%M:%S',
+                                                           timestamp),
+                                   backup_type=BACKUP_TYPE_LOGICAL)
+    dump_tmp_path = os.path.join(temp_path, dump_file)
+    dump_path = os.path.join(target_path, dump_file)
+    dump_user, dump_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_MYSQLDUMP)
+    dump_cmd = MYSQLDUMP_CMD.format(dump_user=dump_user,
+                                    dump_pass=dump_pass,
+                                    host=instance.hostname,
+                                    port=instance.port)
+
+    with open(dump_tmp_path, "w") as out:
+        log.info('Running dump')
+        log.info('{dump_cmd} | {pigz} > {dump_tmp_path}'
+                 ''.format(dump_cmd=dump_cmd,
+                           pigz=PIGZ,
+                           dump_tmp_path=dump_tmp_path))
+        dump = subprocess.Popen(dump_cmd,
+                                shell=True,
+                                stdout=subprocess.PIPE,
+                                stderr=sys.stderr)
+        pigz = subprocess.Popen(PIGZ,
+                                shell=True,
+                                stdin=dump.stdout,
+                                stdout=out,
+                                stderr=sys.stderr)
+        dump.wait()
+        pigz.wait()
+        if dump.returncode != 0:
+            raise Exception("Error: mysqldump did not succeed, aborting")
+
+    log.info('Moving backup and to {target}'.format(target=target_path))
+    os.rename(dump_tmp_path, dump_path)
+    log.info('mysqldump was successful')
+    return dump_path
+
+
+def xtrabackup_instance(instance, timestamp):
     """ Take a compressed mysql backup
 
     Args:
     instance - A hostaddr instance
+    timestamp - A timestamp which will be used to create the backup filename
 
     Returns:
     A string of the path to the finished backup
@@ -173,10 +254,11 @@ def xtrabackup_instance(instance):
     # Prevent issues with too many open files
     resource.setrlimit(resource.RLIMIT_NOFILE, (131072, 131072))
     (temp_path, target_path) = get_paths(port=str(instance.port))
-    backup_file = ("mysql-{host}-{port}-{timestamp}.xbstream"
-                   ).format(host=instance.hostname,
-                            port=str(instance.port),
-                            timestamp=time.strftime('%Y-%m-%d-%H:%M:%S'))
+    backup_file = BACKUP_FILE.format(hostname=instance.hostname,
+                                     port=instance.port,
+                                     timestamp=time.strftime('%Y-%m-%d-%H:%M:%S',
+                                                             timestamp),
+                                     backup_type=BACKUP_TYPE_XBSTREAM)
     tmp_xtra_path = os.path.join(temp_path, backup_file)
     target_xtra_path = os.path.join(target_path, backup_file)
     tmp_log = ''.join((tmp_xtra_path, '.log'))
@@ -189,28 +271,21 @@ def xtrabackup_instance(instance):
         cnf = host_utils.MYSQL_CNF_FILE
         cnf_group = 'mysqld{port}'.format(port=instance.port)
     datadir = host_utils.get_cnf_setting('datadir', instance.port)
-    xtra_user, xtra_pass = mysql_lib.get_mysql_user_for_role('xtrabackup')
-
-    cmd = ('/bin/bash -c "/usr/bin/innobackupex {datadir} {XTRA_DEFAULTS} '
-           '--user={xtra_user} --password={xtra_pass} '
-           '--defaults-file={cnf} --defaults-group={cnf_group} '
-           '--port={port} 2>{tmp_log} '
-           '>{dest}"').format(datadir=datadir,
-                              XTRA_DEFAULTS=XTRA_DEFAULTS,
-                              xtra_user=xtra_user,
-                              xtra_pass=xtra_pass,
-                              cnf=cnf,
-                              cnf_group=cnf_group,
-                              port=instance.port,
-                              tmp_log=tmp_log,
-                              dest=tmp_xtra_path)
-
+    xtra_user, xtra_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_XTRABACKUP)
+    cmd = XTRABACKUP_CMD.format(datadir=datadir,
+                                xtra_user=xtra_user,
+                                xtra_pass=xtra_pass,
+                                cnf=cnf,
+                                cnf_group=cnf_group,
+                                port=instance.port,
+                                tmp_log=tmp_log,
+                                tmp_xtra_path=tmp_xtra_path)
     log.info(cmd)
     xtra = subprocess.Popen(cmd, shell=True)
     xtra.wait()
     with open(tmp_log, 'r') as log_file:
         xtra_log = log_file.readlines()
-        if 'innobackupex: completed OK!' not in xtra_log[-1]:
+        if INNOBACKUP_OK not in xtra_log[-1]:
             raise Exception('innobackupex failed. '
                             'log_file: {tmp_log}'.format(tmp_log=tmp_log))
 
@@ -413,7 +488,7 @@ def s3_upload(backup_file):
         raise Exception("Error: Upload to s3 failed.")
 
 
-def get_s3_backup(hostaddr, date=None):
+def get_s3_backup(hostaddr, date=None, backup_type=BACKUP_TYPE_XBSTREAM):
     """ Find the most recent xbstream file for an instance on s3
 
     Args:
@@ -421,7 +496,7 @@ def get_s3_backup(hostaddr, date=None):
     date - Desired date of restore file
 
     Returns:
-    filename - The path to the most recent xbstream file
+    filename - The path to the most recent backup file
     """
     prefix = 'mysql-{host}-{port}'.format(host=hostaddr.hostname,
                                           port=hostaddr.port)
@@ -447,9 +522,11 @@ def get_s3_backup(hostaddr, date=None):
 
     latest_backup = None
     for elem in bucket_items:
-        # don't even consider files that aren't large enough.
-        if XBSTREAM_SUFFIX in elem.name and elem.size > MINIMUM_VALID_BACKUP_SIZE_BYTES:
-            if not latest_backup or elem.last_modified > latest_backup.last_modified:
+        if elem.name.endswith(backup_type):
+            # xbstream files need to be larger than
+            # MINIMUM_VALID_BACKUP_SIZE_BYTES
+            if (backup_type != BACKUP_TYPE_XBSTREAM) or\
+               (elem.size > MINIMUM_VALID_BACKUP_SIZE_BYTES):
                 latest_backup = elem
     if not latest_backup:
         msg = ('Unable to find a valid backup for '
@@ -459,6 +536,28 @@ def get_s3_backup(hostaddr, date=None):
               '{size}'.format(s3_path=latest_backup.name,
                               size=latest_backup.size))
     return (latest_backup.name, latest_backup.size)
+
+
+def restore_logical(s3_key, size):
+    """ Restore a compressed mysqldump file from s3 to localhost, port 3306
+
+    Args:
+    s3_key - A string which is the path to the compressed dump
+    port - The port on which to act on on localhost
+    size - An int for the size in bytes for remote unpacks for a progress bar
+    """
+    cmd = ('{s3_script} get --no-md5 -b {bucket} -k {s3_key} 2>/dev/null'
+           '| {pv} -s {size}'
+           '| zcat '
+           '| mysql ').format(s3_script=S3_SCRIPT,
+                              bucket=environment_specific.S3_BUCKET,
+                              s3_key=urllib.quote_plus(s3_key),
+                              pv=PV,
+                              size=size)
+    log.info(cmd)
+    import_proc = subprocess.Popen(cmd, shell=True)
+    if import_proc.wait() != 0:
+        raise Exception("Error: Import failed")
 
 
 def start_restore_log(instance, params):

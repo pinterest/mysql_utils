@@ -4,14 +4,15 @@ import datetime
 import os
 import sys
 import time
-from lib import environment_specific
-from lib import backup
-from lib import host_utils
-from lib import mysql_lib
+
 import modify_mysql_zk
-import mysql_backup_xtrabackup
+import mysql_backup
 import mysql_cnf_builder
 import mysql_init_server
+from lib import backup
+from lib import environment_specific
+from lib import host_utils
+from lib import mysql_lib
 
 
 # It might be better to eventually puppetize this, but
@@ -158,7 +159,7 @@ def restore_instance(restore_source, destination, restore_type,
                      'are doing and we will try to take a backup in case '
                      'you are wrong.')
             try:
-                mysql_backup_xtrabackup.xtrabackup_backup_instance(destination)
+                mysql_backup.mysql_backup(destination)
             except Exception as e:
                 log.error(e)
                 log.warning('Unable to take a backup. We will give you {time} '
@@ -326,7 +327,7 @@ def restore_instance(restore_source, destination, restore_type,
 
     backup.update_restore_log(master, row_id, {'finished_at': True})
     log.info('Starting a new backup')
-    mysql_backup_xtrabackup.xtrabackup_backup_instance(destination)
+    mysql_backup.mysql_backup(destination)
 
 
 def find_a_backup_to_restore(restore_type, source, destination, date):
@@ -343,7 +344,7 @@ def find_a_backup_to_restore(restore_type, source, destination, date):
     restore_type - Which method to download a backup shoudl be used
     restore_source - Where the backup was taken
     retore_file - Where the file exists on whichever storage
-    restore-size - What is the size of the backup
+    restore_size - What is the size of the backup in bytes
     """
     zk = host_utils.MysqlZookeeper()
     possible_sources = set()

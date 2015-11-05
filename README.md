@@ -104,10 +104,16 @@ override the configuration in a variety of ways.
 This script will modify our service discovery system in a variety of ways.
   - **mysql_backup_status.py**
 This script checks that backups have run across all replica sets and optionally
-display the created backup files.
+display the created backup files. This script only checks xtrabackup backups
+  - **mysql_backup.py**
+This script is the entry point for backups for MySQL. It can perform logical
+and xtrabackup backups.
+  - **mysql_backup_logical.py**
+This script is basically shorthand for running a logical backup through
+mysql_backup.py.
   - **mysql_backup_xtrabackup.py**
-This script is our primary backup system for MySQL. These backups are used by
-mysql_restore_xtrabackup for building new MySQL instances.
+This script is basically shorthand for running a xtrabackups backup through
+mysql_backup.py.
   - **mysql_checksum.py**
 This script is run every day, and runs a pt-checksum against a subset of the
 shards in order to verify that master and slave are not out of sync and if so,
@@ -141,9 +147,11 @@ mysql instance and then imports users.
 This script provides administrators a quick view of what is in production in a
 format that is easy to use for shell scripting. The script can also pull in
 hardware, availability zone, etc...
+  - **mysql_restore_logical.py**
+This script finds a logical backup, restores it, sets up replication.
   - **mysql_restore_xtrabackup.py**
-This script finds a backup, restores it, sets up replication and then
-adds the new instance to service discovery based on data recorded by
+This script finds a xtrabackup backup, restores it, sets up replication and
+then adds the new instance to service discovery based on data recorded by
 launch_replacement_db_host.py.
   - **mysql_shard_status.py**
 This script displays the status in service discovery of an instance. Primarily

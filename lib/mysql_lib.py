@@ -22,6 +22,7 @@ HEARTBEAT_SAFETY_MARGIN = 10
 
 AUTH_FILE = '/var/config/config.services.mysql_auth'
 CONNECT_TIMEOUT = 2
+INVALID = 'INVALID'
 METADATA_DB = 'test'
 MYSQLADMIN = '/usr/bin/mysqladmin'
 MYSQL_ERROR_ACCESS_DENIED = 1045
@@ -726,7 +727,9 @@ def restart_replication(conn):
     conn - a connection to the replica
     """
     cursor = conn.cursor()
+    warnings.filterwarnings('ignore', category=MySQLdb.Warning)
     cursor.execute('STOP SLAVE')
+    warnings.resetwarnings()
     cursor.execute('START SLAVE')
     time.sleep(1)
 
@@ -819,25 +822,32 @@ def wait_replication_catch_up(slave_hostaddr):
     sleep_duration = 60
     while True:
         replication = calc_slave_lag(slave_hostaddr)
-        if replication['sql_bytes'] is None:
-            log.info(replication)
-            raise Exception("Could not compute replication lag")
 
-        if replication['ss']['Slave_IO_Running'] != 'Yes':
-            log.warning('IO thread is not running, going to sleep 15 '
-                        'seconds in case things get better on their own')
-            time.sleep(15)
+        if (replication['ss']['Slave_IO_Running'] != 'Yes' or
+           replication['sbm'] is None or
+           replication['sql_bytes'] is None or
+           replication['sbm'] == INVALID or
+           replication['ss']['Slave_SQL_Running'] != 'Yes'):
+            log.warning('Replication does not appear sane, going to sleep 60 '
+                        'seconds in case things get better on their own.'
+                        'Replication info: {repl}'.format(repl=replication))
+            time.sleep(60)
             replication = calc_slave_lag(slave_hostaddr)
-            if replication['ss']['Slave_IO_Running'] != 'Yes':
-                raise Exception("IO thread is not running")
-
-        if replication['ss']['Slave_SQL_Running'] != 'Yes':
-            raise Exception("SQL thread is not running")
+            if (replication['ss']['Slave_IO_Running'] != 'Yes' or
+               replication['sbm'] is None or
+               replication['sbm'] == INVALID or
+               replication['sql_bytes'] is None or
+               replication['ss']['Slave_SQL_Running'] != 'Yes'):
+                raise Exception('Replication appear to be broken and not '
+                                'getting better. '
+                                'Replication info: {repl}'.format(repl=replication))
 
         if replication['sbm'] < catch_up_sbm:
             log.info('Replication computed seconds behind master {sbm} < '
-                     '{catch_up_sbm}'.format(sbm=replication['sbm'],
-                                             catch_up_sbm=catch_up_sbm))
+                     '{catch_up_sbm}, which is "good enough".'
+                     'Full replication info: {repl}'.format(sbm=replication['sbm'],
+                                                            catch_up_sbm=catch_up_sbm,
+                                                            repl=replication))
             break
         else:
             if last_sbm:
@@ -881,15 +891,15 @@ def calc_slave_lag(slave_hostaddr, dead_master=False):
     ss - None or the results of running "show slave status'
     """
 
-    ret = {'sql_bytes': 'INVALID',
-           'sql_binlogs': 'INVALID',
-           'io_bytes': 'INVALID',
-           'io_binlogs': 'INVALID',
-           'sbm': 'INVALID',
-           'ss': {'Slave_IO_Running': 'INVALID',
-                  'Slave_SQL_Running': 'INVALID',
-                  'Master_Host': 'INVALID',
-                  'Master_Port': 'INVALID'}}
+    ret = {'sql_bytes': INVALID,
+           'sql_binlogs': INVALID,
+           'io_bytes': INVALID,
+           'io_binlogs': INVALID,
+           'sbm': INVALID,
+           'ss': {'Slave_IO_Running': INVALID,
+                  'Slave_SQL_Running': INVALID,
+                  'Master_Host': INVALID,
+                  'Master_Port': INVALID}}
     try:
         slave_conn = connect_mysql(slave_hostaddr)
     except MySQLdb.OperationalError as detail:
@@ -1113,6 +1123,70 @@ def get_mysql_backups(conn, instance, date, bu_type='xbstream'):
         return ret['filename']
     else:
         return None
+
+
+def start_backup_log(instance, backup_type, timestamp):
+    """ Start a log of a mysql backup
+
+    Args:
+    instance - A hostaddr object for the instance being backed up
+    backup_type - Either xbstream or sql
+    timestamp - The timestamp from when the backup began
+    """
+    row_id = None
+    try:
+        reporting_conn = get_mysqlops_connections()
+        cursor = reporting_conn.cursor()
+
+        sql = ("INSERT INTO mysqlops.mysql_backups "
+               "SET "
+               "hostname = %(hostname)s, "
+               "port = %(port)s, "
+               "started = %(started)s, "
+               "backup_type = %(backup_type)s ")
+
+        metadata = {'hostname': instance.hostname,
+                    'port': str(instance.port),
+                    'started': time.strftime('%Y-%m-%d %H:%M:%S', timestamp),
+                    'backup_type': backup_type}
+        cursor.execute(sql, metadata)
+        row_id = cursor.lastrowid
+        reporting_conn.commit()
+        log.info(cursor._executed)
+    except Exception as e:
+        log.warning("Unable to write log entry to "
+                    "mysqlopsdb001: {e}".format(e=e))
+        log.warning("However, we will attempt to continue with the backup.")
+    return row_id
+
+
+def finalize_backup_log(id, filename, size):
+    """ Write final details of a mysql backup
+
+    id - A pk from the mysql_backups table
+    filename - The location of the resulting backup
+    size -  The size of the compressed backup
+    """
+    try:
+        reporting_conn = get_mysqlops_connections()
+        cursor = reporting_conn.cursor()
+        sql = ("UPDATE mysqlops.mysql_backups "
+               "SET "
+               "filename = %(filename)s, "
+               "finished = %(finished)s, "
+               "size = %(size)s "
+               "WHERE id = %(id)s")
+        metadata = {'filename': filename,
+                    'finished': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'size': size,
+                    'id': id}
+        cursor.execute(sql, metadata)
+        reporting_conn.commit()
+        reporting_conn.close()
+        log.info(cursor._executed)
+    except Exception as e:
+        log.warning("Unable to update mysqlopsdb with "
+                    "backup status: {e}".format(e=e))
 
 
 def get_installed_mysqld_version():

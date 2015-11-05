@@ -6,9 +6,10 @@ import uuid
 
 import MySQLdb
 
-from lib import host_utils
+import launch_replacement_db_host
 import modify_mysql_zk
 from lib import mysql_lib
+from lib import host_utils
 from lib import environment_specific
 
 MAX_ALIVE_MASTER_SLAVE_LAG_SECONDS = 60
@@ -227,6 +228,12 @@ def mysql_failover(master, dry_run, skip_lock,
         release_promotion_lock(lock_identifier)
 
     log.info('Failover complete')
+
+    if not master_conn:
+        log.info('As master is dead, will try to launch a replacement. Will '
+                 'sleep 20 seconds first to let things settle')
+        time.sleep(20)
+        launch_replacement_db_host.launch_replacement_db_host(master)
 
 
 def get_promotion_lock(replica_set):

@@ -160,6 +160,9 @@ def launch_replacement_db_host(original_server,
         raise Exception('Could not find information about server to be '
                         'replaced in the cmdb')
 
+    if 'aws_status.codes' in cmdb_data:
+        reasons.add(cmdb_data['aws_status.codes'])
+
     log.info('Data from cmdb: {cmdb_data}'.format(cmdb_data=cmdb_data))
     replacement_config = {'availability_zone': cmdb_data['location'],
                           'hostname': find_unused_server_name(original_server.get_standardized_replica_set(),
@@ -238,7 +241,8 @@ def launch_replacement_db_host(original_server,
     # If we get to here and there is no reason, bail out
     if not reasons and not replacement_config['dry_run']:
         raise Exception(('MySQL appears to be up and no reason for '
-                         'replacement is supplied'))
+                         'replacement is supplied. You can specify a reason'
+                         'with the --reason argument'))
     reason = ', '.join(reasons)
     log.info('Reason for launch: {reason}'.format(reason=reason))
 
@@ -433,7 +437,14 @@ def get_master_mysql_major_version(instance):
     zk = host_utils.MysqlZookeeper()
     master = zk.get_mysql_instance_from_replica_set(instance.get_zk_replica_set()[0],
                                                     repl_type=host_utils.REPLICA_ROLE_MASTER)
-    master_conn = mysql_lib.connect_mysql(master)
+    try:
+        master_conn = mysql_lib.connect_mysql(master)
+    except _mysql_exceptions.OperationalError:
+        raise Exception('Could not connect to master server {instance} in '
+                        'order to determine MySQL version to launch with. '
+                        'Perhaps run this script from there? This is likely '
+                        'due to firewall rules.'
+                        ''.format(instance=instance.hostname))
     mysql_version = mysql_lib.get_global_variables(master_conn)['version'][:3]
     return mysql_version
 

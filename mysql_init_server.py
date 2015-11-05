@@ -3,11 +3,12 @@ import argparse
 import ConfigParser
 import glob
 import os
-from lib import environment_specific
-import mysql_backup_xtrabackup
+
+import mysql_backup
 import mysql_cnf_builder
 import mysql_grants
 from lib import backup
+from lib import environment_specific
 from lib import host_utils
 from lib import mysql_lib
 
@@ -124,7 +125,7 @@ def mysql_init_server(instance,
 
     if not skip_backup:
         log.info('Taking a backup')
-        mysql_backup_xtrabackup.xtrabackup_backup_instance(instance)
+        mysql_backup.backup_instance(instance)
 
 
 def basic_host_sanity():

@@ -125,7 +125,7 @@ def mysql_init_server(instance,
 
     if not skip_backup:
         log.info('Taking a backup')
-        mysql_backup.backup_instance(instance)
+        mysql_backup.mysql_backup(instance)
 
 
 def basic_host_sanity():

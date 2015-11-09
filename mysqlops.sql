@@ -22,7 +22,7 @@ CREATE TABLE `mysql_backups` (
   `started` datetime NOT NULL,
   `finished` datetime DEFAULT NULL,
   `size` bigint(20) unsigned NOT NULL DEFAULT '0',
-  `backup_type` enum('sql','xbstream') DEFAULT NULL,
+  `backup_type` enum('sql.gz','xbstream') DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `filename` (`filename`),
   KEY `hostname` (`hostname`,`port`,`finished`)

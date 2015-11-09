@@ -2,3 +2,5 @@
 thread_handling = pool-of-threads
 thread_pool_size = 36
 max_connections = 15000
+innodb_io_capacity = 1000
+innodb_io_capacity_max = 2000

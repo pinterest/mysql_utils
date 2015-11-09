@@ -1,5 +1,4 @@
 [mysqld3306]
-max_binlog_files = 2000
 innodb_flush_log_at_trx_commit = 2
 sync_binlog = 0
 slave_parallel_workers = 16

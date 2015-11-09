@@ -4,3 +4,4 @@ innodb_io_capacity_max = 10000
 innodb_buffer_pool_size = 24000M
 innodb_log_file_size = 1G
 innodb_lru_scan_depth = 2048
+max_binlog_files = 300

@@ -400,8 +400,15 @@ def confirm_max_replica_lag(replicas, max_lag, dead_master,
                                 'on the master?'.format(replica=replica))
 
             if repl_check['ss']['Slave_SQL_Running'] != 'Yes':
-                raise Exception('SQL thread on replica {replica} is not running. '
-                                'Perhaps run start slave?'.format(replica=replica))
+                log.info('SQL thread is not running, trying to restart, then '
+                         'sleep 20 seconds')
+                conn = mysql_lib.connect_mysql(replica)
+                mysql_lib.restart_replication(conn)
+                time.sleep(20)
+                repl_check = mysql_lib.calc_slave_lag(replica, dead_master=dead_master)
+                if repl_check['ss']['Slave_SQL_Running'] != 'Yes':
+                    raise Exception('SQL thread on {replica} has serious '
+                                    'problems'.format(replica=replica))
 
             if max_lag == 0:
                 if repl_check['sql_bytes'] != 0:

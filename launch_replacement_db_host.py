@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import datetime
 
 import MySQLdb
 import _mysql_exceptions
@@ -13,6 +14,10 @@ SUPPORTED_MYSQL_MAJOR_VERSIONS = {'5.5': '55', '5.6': '56'}
 DEFAULT_MYSQL_MAJOR_VERSION = '5.6'
 SUPPORTED_MYSQL_MINOR_VERSIONS = set(('stable', 'staging', 'latest'))
 DEFAULT_MYSQL_MINOR_VERSION = 'stable'
+# After SERVER_BUILD_TIMEOUT we can assume that the build failed
+# and automatically go into --replace_again mode
+SERVER_BUILD_TIMEOUT = 7
+
 
 log = environment_specific.setup_logging_defaults(__name__)
 
@@ -147,12 +152,22 @@ def launch_replacement_db_host(original_server,
     existing_replacement = find_existing_replacements(reporting_conn,
                                                       original_server)
     if existing_replacement and not not_a_replacement:
+        log.info('A replacement has already been requested: '
+                 '{re}'.format(re=existing_replacement))
         if replace_again:
-            log.info('A replacement has already been requested: '
-                     '{new_host}'.format(new_host=existing_replacement))
+            log.info('Argument replace_again is set, continuing on.')
         else:
-            raise Exception('A replacement already exists, but '
-                            'replace_again is not True')
+            age_of_replacement = datetime.datetime.now() - existing_replacement['created_at']
+            if age_of_replacement.days < SERVER_BUILD_TIMEOUT:
+                raise Exception('Argument replace_again is not True but a '
+                                'replacement already exists.')
+            else:
+                log.info("A replacement already exists, but was launched "
+                         "{days} ago. The timeout for servers builds is "
+                         "{timeout} so we are automatically setting "
+                         "replace_again.".format(days=age_of_replacement.days,
+                                                 timeout=SERVER_BUILD_TIMEOUT))
+                replace_again = True
 
     # Pull some information from cmdb.
     cmdb_data = environment_specific.get_server_metadata(original_server.hostname)

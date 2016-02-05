@@ -13,17 +13,34 @@ import mysql_connect
 from lib import environment_specific
 
 
-# Max IO thread lag in bytes. If more than MAX_IO_LAG refuse to modify zk, etc
+# Max IO thread lag in bytes. If more than NORMAL_IO_LAG refuse to modify zk, etc
 # 10k bytes of lag is just a few seconds normally
-MAX_IO_LAG = 10485760
-# Max lag in seconds. If more than MAX_HEARTBEAT_LAG refuse to modify zk, etc
-MAX_HEARTBEAT_LAG = 120
+NORMAL_IO_LAG = 10485760
+# Max lag in seconds. If more than NORMAL_HEARTBEAT_LAG refuse to modify zk, or
+# attempt a live master failover
+NORMAL_HEARTBEAT_LAG = 120
 HEARTBEAT_SAFETY_MARGIN = 10
+# Max lag in second for a dead master failover
+LOOSE_HEARTBEAT_LAG = 3600
+
+CHECK_SQL_THREAD = 'sql'
+CHECK_IO_THREAD = 'io'
+CHECK_CORRECT_MASTER = 'master'
+ALL_REPLICATION_CHECKS = set([CHECK_SQL_THREAD,
+                              CHECK_IO_THREAD,
+                              CHECK_CORRECT_MASTER])
+REPLICATION_THREAD_SQL = 'SQL'
+REPLICATION_THREAD_IO = 'IO'
+REPLICATION_THREAD_ALL = 'ALL'
+REPLICATION_THREAD_TYPES = set([REPLICATION_THREAD_SQL,
+                                REPLICATION_THREAD_IO,
+                                REPLICATION_THREAD_ALL])
 
 AUTH_FILE = '/var/config/config.services.mysql_auth'
 CONNECT_TIMEOUT = 2
 INVALID = 'INVALID'
 METADATA_DB = 'test'
+MYSQL_DATETIME_TO_PYTHON = '%Y-%m-%dT%H:%M:%S.%f'
 MYSQLADMIN = '/usr/bin/mysqladmin'
 MYSQL_ERROR_ACCESS_DENIED = 1045
 MYSQL_ERROR_CONN_HOST_ERROR = 2003
@@ -34,6 +51,9 @@ MYSQL_ERROR_NO_SUCH_THREAD = 1094
 MYSQL_ERROR_UNKNOWN_VAR = 1193
 MYSQL_ERROR_FUNCTION_EXISTS = 1125
 MYSQL_VERSION_COMMAND = '/usr/sbin/mysqld --version'
+REPLICATION_TOLERANCE_NONE = 'None'
+REPLICATION_TOLERANCE_NORMAL = 'Normal'
+REPLICATION_TOLERANCE_LOOSE = 'Loose'
 
 
 class ReplicationError(Exception):
@@ -174,9 +194,8 @@ def get_master_from_instance(instance):
     Returns:
     master - A hostaddr object or None
     """
-    conn = connect_mysql(instance, 'admin')
     try:
-        ss = get_slave_status(conn)
+        ss = get_slave_status(instance)
     except ReplicationError:
         return None
 
@@ -185,11 +204,11 @@ def get_master_from_instance(instance):
                                         str(ss['Master_Port']))))
 
 
-def get_slave_status(conn):
+def get_slave_status(instance):
     """ Get MySQL replication status
 
     Args:
-    db - a connection to the server as administrator
+    instance - A hostaddr object
 
     Returns:
     a dict describing the replication status.
@@ -236,7 +255,9 @@ def get_slave_status(conn):
      'Until_Log_File': '',
      'Until_Log_Pos': 0L}
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     cursor.execute("SHOW SLAVE STATUS")
     slave_status = cursor.fetchone()
     if slave_status is None:
@@ -244,11 +265,21 @@ def get_slave_status(conn):
     return slave_status
 
 
-def get_master_status(conn):
+def flush_master_log(instance):
+    """ Flush binary logs
+
+    Args:
+    instance - a hostAddr obect
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    cursor.execute("FLUSH BINARY LOGS")
+
+def get_master_status(instance):
     """ Get poisition of most recent write to master replication logs
 
     Args:
-    db - a connection to the server as administrator
+    instance - a hostAddr object
 
     Returns:
     a dict describing the master status
@@ -259,7 +290,9 @@ def get_master_status(conn):
      'File': 'mysql-bin.019324',
      'Position': 61559L}
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     cursor.execute("SHOW MASTER STATUS")
     master_status = cursor.fetchone()
     if master_status is None:
@@ -267,7 +300,7 @@ def get_master_status(conn):
     return master_status
 
 
-def get_master_logs(conn):
+def get_master_logs(instance):
     """ Get MySQL binary log names and size
 
     Args
@@ -289,10 +322,40 @@ def get_master_logs(conn):
      {'File_size': 104857726L, 'Log_name': 'mysql-bin.000290'},
      {'File_size': 47024156L, 'Log_name': 'mysql-bin.000291'})
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     cursor.execute("SHOW MASTER LOGS")
     master_status = cursor.fetchall()
     return master_status
+
+
+def get_binlog_archiving_lag(instance):
+    """ Get date of creation of most recent binlog archived
+
+    Args:
+    instance - a hostAddr object
+
+    Returns:
+    A datetime object
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    sql  = ("SELECT binlog_creation "
+            "FROM {db}.{tbl} "
+            "WHERE hostname= %(hostname)s  AND "
+            "      port = %(port)s "
+            "ORDER BY binlog_creation DESC "
+            "LIMIT 1;").format(db=METADATA_DB,
+                               tbl=environment_specific.BINLOG_ARCHIVING_TABLE_NAME)
+    params = {'hostname': instance.hostname,
+              'port': instance.port}
+    cursor.execute(sql, params)
+    res = cursor.fetchone()
+    if res:
+        return res['binlog_creation']
+    else:
+        return None
 
 
 def calc_binlog_behind(log_file_num, log_file_pos, master_logs):
@@ -307,7 +370,6 @@ def calc_binlog_behind(log_file_num, log_file_pos, master_logs):
     bytes_behind - bytes of lag across all log file
     binlogs_behind - number of binlogs lagged
     """
-
     binlogs_behind = 0
     bytes_behind = 0
     for binlog in master_logs:
@@ -321,16 +383,16 @@ def calc_binlog_behind(log_file_num, log_file_pos, master_logs):
     return bytes_behind, binlogs_behind
 
 
-def get_global_variables(conn):
+def get_global_variables(instance):
     """ Get MySQL global variables
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - A hostAddr object
 
     Returns:
     A dict with the key the variable name
     """
-
+    conn = connect_mysql(instance)
     ret = dict()
     cursor = conn.cursor()
     cursor.execute("SHOW GLOBAL VARIABLES")
@@ -341,19 +403,20 @@ def get_global_variables(conn):
     return ret
 
 
-def get_dbs(conn):
+def get_dbs(instance):
     """ Get MySQL databases other than mysql, information_schema,
     performance_schema and test
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - A hostAddr object
 
     Returns
     A set of databases
     """
-
-    ret = set()
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+    ret = set()
+
     cursor.execute(' '.join(("SELECT schema_name",
                              "FROM information_schema.schemata",
                              "WHERE schema_name NOT IN('mysql',",
@@ -367,20 +430,22 @@ def get_dbs(conn):
     return ret
 
 
-def does_table_exist(conn, db, table):
+def does_table_exist(instance, db, table):
     """ Return True if a given table exists in a given database.
 
     Args:
-        conn - A connection to the MySQL instance
-        db - A string that contains the database name we're looking for
-        table - A string containing the name of the table we're looking for
+    instance - A hostAddr object
+    db - A string that contains the database name we're looking for
+    table - A string containing the name of the table we're looking for
 
     Returns:
-        True if the table was found.
-        False if not or there was an exception.
+    True if the table was found.
+    False if not or there was an exception.
     """
-    table_exists = False
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+    table_exists = False
+
     try:
         sql = ("SELECT COUNT(*) AS cnt FROM information_schema.tables "
                "WHERE table_schema=%(db)s AND table_name=%(tbl)s")
@@ -397,22 +462,24 @@ def does_table_exist(conn, db, table):
     return table_exists
 
 
-def get_tables(conn, db, skip_views=False):
+def get_tables(instance, db, skip_views=False):
     """ Get a list of tables and views in a given database or just
         tables.  Default to include views so as to maintain backward
         compatibility.
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - A hostAddr object
     db - a string which contains a name of a db
     skip_views - true if we want tables only, false if we want everything
 
     Returns
     A set of tables
     """
-    ret = set()
-    param = {'db': db}
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+    ret = set()
+
+    param = {'db': db}
     sql = ''.join(("SELECT TABLE_NAME ",
                    "FROM information_schema.tables ",
                    "WHERE TABLE_SCHEMA=%(db)s "))
@@ -420,9 +487,36 @@ def get_tables(conn, db, skip_views=False):
         sql = sql + ' AND TABLE_TYPE="BASE TABLE" '
 
     cursor.execute(sql, param)
-    tables = cursor.fetchall()
-    for table in tables:
+    for table in cursor.fetchall():
         ret.add(table['TABLE_NAME'])
+
+    return ret
+
+
+def get_columns_for_table(instance, db, table):
+    """ Get a list of columns in a table
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+    table - the name of the table to fetch columns
+
+    Returns
+    A list of columns
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    ret = list()
+
+    param = {'db': db,
+             'table': table}
+    sql = ("SELECT COLUMN_NAME "
+           "FROM information_schema.columns "
+           "WHERE TABLE_SCHEMA=%(db)s AND"
+           "      TABLE_NAME=%(table)s")
+    cursor.execute(sql, param)
+    for column in cursor.fetchall():
+        ret.append(column['COLUMN_NAME'])
 
     return ret
 
@@ -437,11 +531,12 @@ def setup_semisync_plugins(instance):
         instance - A hostaddr object
     """
     conn = connect_mysql(instance)
-    version = get_global_variables(conn)['version']
+    cursor = conn.cursor()
+
+    version = get_global_variables(instance)['version']
     if version[0:3] == '5.5':
         return
 
-    cursor = conn.cursor()
     try:
         cursor.execute("INSTALL PLUGIN rpl_semi_sync_master SONAME 'semisync_master.so'")
     except MySQLdb.OperationalError as detail:
@@ -465,11 +560,12 @@ def setup_response_time_metrics(instance):
     instance -  A hostaddr object
     """
     conn = connect_mysql(instance)
-    version = get_global_variables(conn)['version']
+    cursor = conn.cursor()
+
+    version = get_global_variables(instance)['version']
     if version[0:3] != '5.6':
         return
 
-    cursor = conn.cursor()
     try:
         cursor.execute("INSTALL PLUGIN QUERY_RESPONSE_TIME_AUDIT SONAME 'query_response_time.so'")
     except MySQLdb.OperationalError as detail:
@@ -501,16 +597,18 @@ def setup_response_time_metrics(instance):
     cursor.execute("SET GLOBAL QUERY_RESPONSE_TIME_STATS=ON")
 
 
-def enable_and_flush_activity_statistics(conn):
+def enable_and_flush_activity_statistics(instance):
     """ Reset counters for table statistics
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr obect
     """
-    global_vars = get_global_variables(conn)
-    if global_vars['userstat'] != 'ON':
-        set_global_variable(conn, 'userstat', True)
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
+    global_vars = get_global_variables(instance)
+    if global_vars['userstat'] != 'ON':
+        set_global_variable(instance, 'userstat', True)
 
     sql = 'FLUSH TABLE_STATISTICS'
     log.info(sql)
@@ -521,23 +619,25 @@ def enable_and_flush_activity_statistics(conn):
     cursor.execute(sql)
 
 
-def get_dbs_activity(conn):
+def get_dbs_activity(instance):
     """ Return rows read and changed from a MySQL instance by db
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
 
     Returns:
     A dict with a key of the db name and entries for rows read and rows changed
     """
-    global_vars = get_global_variables(conn)
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    ret = dict()
+
+    global_vars = get_global_variables(instance)
     if global_vars['userstat'] != 'ON':
         raise InvalidVariableForOperation('Userstats must be enabled on ',
                                           'for table_statistics to function. '
                                           'Perhaps run "SET GLOBAL userstat = '
                                           'ON" to fix this.')
-    ret = dict()
-    cursor = conn.cursor()
 
     sql = ("SELECT SCHEMA_NAME, "
            "    SUM(ROWS_READ) AS 'ROWS_READ', "
@@ -560,23 +660,25 @@ def get_dbs_activity(conn):
     return ret
 
 
-def get_user_activity(conn):
+def get_user_activity(instance):
     """ Return information about activity broken down by mysql user accoutn
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
 
     Returns:
     a dict of user activity since last flush
     """
-    global_vars = get_global_variables(conn)
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    ret = dict()
+
+    global_vars = get_global_variables(instance)
     if global_vars['userstat'] != 'ON':
         raise InvalidVariableForOperation('Userstats must be enabled on ',
                                           'for table_statistics to function. '
                                           'Perhaps run "SET GLOBAL userstat = '
                                           'ON" to fix this.')
-    ret = dict()
-    cursor = conn.cursor()
 
     sql = 'SELECT * FROM information_schema.USER_STATISTICS'
     cursor.execute(sql)
@@ -589,16 +691,18 @@ def get_user_activity(conn):
     return ret
 
 
-def get_connected_users(conn):
+def get_connected_users(instance):
     """ Get all currently connected users
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
 
     Returns:
     a set of users
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     sql = ("SELECT user "
            "FROM information_schema.processlist "
            "GROUP BY user")
@@ -612,11 +716,11 @@ def get_connected_users(conn):
     return ret
 
 
-def show_create_table(conn, db, table, standardize=True):
+def show_create_table(instance, db, table, standardize=True):
     """ Get a standardized CREATE TABLE statement
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
     db - the MySQL database to run against
     table - the table on the db database to run against
     standardize - Remove AUTO_INCREMENT=$NUM and similar
@@ -624,8 +728,9 @@ def show_create_table(conn, db, table, standardize=True):
     Returns:
     A string of the CREATE TABLE statement
     """
-
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     try:
         cursor.execute('SHOW CREATE TABLE `{db}`.`{table}`'.format(table=table,
                                                                    db=db))
@@ -641,14 +746,16 @@ def show_create_table(conn, db, table, standardize=True):
     return ret
 
 
-def create_db(conn, db):
+def create_db(instance, db):
     """ Create a database if it does not already exist
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
     db - the name of the to be created
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     sql = ('CREATE DATABASE IF NOT EXISTS '
            '`{db}`;'.format(db=db))
     log.info(sql)
@@ -659,18 +766,20 @@ def create_db(conn, db):
     warnings.resetwarnings()
 
 
-def copy_db_schema(conn, old_db, new_db, verbose=False, dry_run=False):
+def copy_db_schema(instance, old_db, new_db, verbose=False, dry_run=False):
     """ Copy the schema of one db into a different db
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
     old_db - the source of the schema copy
     new_db - the destination of the schema copy
     verbose - print out SQL commands
     dry_run - do not change any state
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
-    tables = get_tables(conn, old_db)
+
+    tables = get_tables(instance, old_db)
     for table in tables:
         raw_sql = "CREATE TABLE IF NOT EXISTS `{new_db}`.`{table}` LIKE `{old_db}`.`{table}`"
         sql = raw_sql.format(old_db=old_db, new_db=new_db, table=table)
@@ -681,18 +790,20 @@ def copy_db_schema(conn, old_db, new_db, verbose=False, dry_run=False):
             cursor.execute(sql)
 
 
-def move_db_contents(conn, old_db, new_db, verbose=False, dry_run=False):
+def move_db_contents(instance, old_db, new_db, verbose=False, dry_run=False):
     """ Move the contents of one db into a different db
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
     old_db - the source from which to move data
     new_db - the destination to move data
     verbose - print out SQL commands
     dry_run - do not change any state
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
-    tables = get_tables(conn, old_db)
+
+    tables = get_tables(instance, old_db)
     for table in tables:
         raw_sql = "RENAME TABLE `{old_db}`.`{table}` to `{new_db}`.`{table}`"
         sql = raw_sql.format(old_db=old_db, new_db=new_db, table=table)
@@ -713,47 +824,98 @@ def setup_replication(new_master, new_replica):
     log.info('Setting {new_replica} as a replica of new master '
              '{new_master}'.format(new_master=new_master,
                                    new_replica=new_replica))
-    new_master_conn = connect_mysql(new_master)
-    new_master_coordinates = get_master_status(new_master_conn)
+    new_master_coordinates = get_master_status(new_master)
     change_master(new_replica, new_master,
                   new_master_coordinates['File'],
                   new_master_coordinates['Position'])
 
 
-def restart_replication(conn):
+def restart_replication(instance):
     """ Stop then start replication
 
     Args:
-    conn - a connection to the replica
+    instance - A hostAddr object
     """
+    stop_replication(instance)
+    start_replication(instance)
+
+
+def stop_replication(instance, thread_type=REPLICATION_THREAD_ALL):
+    """ Stop replication, if running
+
+    Args:
+    instance - A hostAddr object
+    thread - Which thread to stop. Options are in REPLICATION_THREAD_TYPES.
+    """
+    if thread_type not in REPLICATION_THREAD_TYPES:
+        raise Exception('Invalid input for arg thread: {thread}'
+                        ''.format(thread=thread_type))
+
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
+    ss = get_slave_status(instance)
+    if (ss['Slave_IO_Running'] != 'No' and ss['Slave_SQL_Running'] != 'No' and
+            thread_type == REPLICATION_THREAD_ALL):
+        cmd = 'STOP SLAVE'
+    elif ss['Slave_IO_Running'] != 'No' and thread_type != REPLICATION_THREAD_SQL:
+        cmd = 'STOP SLAVE IO_THREAD'
+    elif ss['Slave_SQL_Running'] != 'No' and thread_type != REPLICATION_THREAD_IO:
+        cmd = 'STOP SLAVE SQL_THREAD'
+    else:
+        log.info('Replication already stopped')
+        return
+
     warnings.filterwarnings('ignore', category=MySQLdb.Warning)
-    cursor.execute('STOP SLAVE')
+    log.info(cmd)
+    cursor.execute(cmd)
     warnings.resetwarnings()
-    cursor.execute('START SLAVE')
+
+
+def start_replication(instance, thread_type=REPLICATION_THREAD_ALL):
+    """ Start replication, if not running
+
+    Args:
+    instance - A hostAddr object
+    thread - Which thread to start. Options are in REPLICATION_THREAD_TYPES.
+    """
+    if thread_type not in REPLICATION_THREAD_TYPES:
+        raise Exception('Invalid input for arg thread: {thread}'
+                        ''.format(thread=thread_type))
+
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    ss = get_slave_status(instance)
+    if (ss['Slave_IO_Running'] != 'Yes' and ss['Slave_SQL_Running'] != 'Yes' and
+            thread_type == REPLICATION_THREAD_ALL):
+        cmd = 'START SLAVE'
+    elif ss['Slave_IO_Running'] != 'Yes' and thread_type != REPLICATION_THREAD_SQL:
+        cmd = 'START SLAVE IO_THREAD'
+    elif ss['Slave_SQL_Running'] != 'Yes' and thread_type != REPLICATION_THREAD_IO:
+        cmd = 'START SLAVE SQL_THREAD'
+    else:
+        log.info('Replication already running')
+        return
+
+    warnings.filterwarnings('ignore', category=MySQLdb.Warning)
+    log.info(cmd)
+    cursor.execute(cmd)
+    warnings.resetwarnings()
     time.sleep(1)
 
 
-def reset_slave(conn):
+def reset_slave(instance):
     """ Stop replicaion and remove all repl settings
 
     Args:
-    conn - a connection to the replica
+    instance - A hostAddr object
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
 
     try:
-        ss = get_slave_status(conn)
-        log.info(('Previous replication settings:', ss))
-        if ss['Slave_IO_Running'] and ss['Slave_SQL_Running']:
-            cmd = 'STOP SLAVE'
-        else:
-            if ss['Slave_IO_Running']:
-                cmd = 'STOP SLAVE IO_THREAD'
-            if ss['Slave_SQL_Running']:
-                cmd = 'STOP SLAVE SQL_THREAD'
-        log.info(cmd)
-        cursor.execute(cmd)
+        stop_replication(instance)
         cmd = 'RESET SLAVE ALL'
         log.info(cmd)
         cursor.execute(cmd)
@@ -774,9 +936,10 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
     no_start - Don't run START SLAVE after CHANGE MASTER
     """
     conn = connect_mysql(slave_hostaddr)
-    set_global_variable(conn, 'read_only', True)
-    reset_slave(conn)
     cursor = conn.cursor()
+
+    set_global_variable(slave_hostaddr, 'read_only', True)
+    reset_slave(slave_hostaddr)
     master_user, master_password = get_mysql_user_for_role('replication')
     parameters = {'master_user': master_user,
                   'master_password': master_password,
@@ -797,17 +960,12 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
     log.info(cursor._executed)
 
     if not no_start:
-        cmd = 'START SLAVE'
-        log.info(cmd)
-        cursor.execute(cmd)
+        start_replication(slave_hostaddr)
         # Replication reporting is wonky for the first second
         time.sleep(1)
-        replication = calc_slave_lag(slave_hostaddr)
-
-        if replication['ss']['Slave_SQL_Running'] != 'Yes':
-            raise Exception("SQL thread is not running")
-        if replication['ss']['Slave_IO_Running'] != 'Yes':
-            raise Exception("IO thread is not running")
+        # Avoid race conditions for zk update monitor
+        assert_replication_sanity(slave_hostaddr,
+                                  set([CHECK_SQL_THREAD, CHECK_IO_THREAD]))
 
 
 def wait_replication_catch_up(slave_hostaddr):
@@ -817,65 +975,160 @@ def wait_replication_catch_up(slave_hostaddr):
     slave_hostaddr - A HostAddr object
     """
     last_sbm = None
-    catch_up_sbm = MAX_HEARTBEAT_LAG - HEARTBEAT_SAFETY_MARGIN
+    catch_up_sbm = NORMAL_HEARTBEAT_LAG - HEARTBEAT_SAFETY_MARGIN
     remaining_time = 'Not yet availible'
-    sleep_duration = 60
+    sleep_duration = 5
+
+    # Confirm that replication is setup at all
+    get_slave_status(slave_hostaddr)
+
+    try:
+        assert_replication_sanity(slave_hostaddr)
+    except:
+        log.warning('Replication does not appear sane, going to sleep 60 '
+                    'seconds in case things get better on their own.')
+        time.sleep(60)
+        assert_replication_sanity(slave_hostaddr)
+
     while True:
         replication = calc_slave_lag(slave_hostaddr)
 
-        if (replication['ss']['Slave_IO_Running'] != 'Yes' or
-           replication['sbm'] is None or
-           replication['sql_bytes'] is None or
-           replication['sbm'] == INVALID or
-           replication['ss']['Slave_SQL_Running'] != 'Yes'):
-            log.warning('Replication does not appear sane, going to sleep 60 '
-                        'seconds in case things get better on their own.'
-                        'Replication info: {repl}'.format(repl=replication))
+        if replication['sbm'] is None or replication['sbm'] == INVALID:
+            log.info('Computed seconds behind master is unavailable, going to '
+                     'sleep for a minute and retry. A likely reason is that '
+                     'there was a failover between when a backup was taken '
+                     'and when a restore was run so there will not be a '
+                     'entry until replication has caught up more. If this is '
+                     'a new replica set, read_only is probably ON on the '
+                     'master server.')
             time.sleep(60)
-            replication = calc_slave_lag(slave_hostaddr)
-            if (replication['ss']['Slave_IO_Running'] != 'Yes' or
-               replication['sbm'] is None or
-               replication['sbm'] == INVALID or
-               replication['sql_bytes'] is None or
-               replication['ss']['Slave_SQL_Running'] != 'Yes'):
-                raise Exception('Replication appear to be broken and not '
-                                'getting better. '
-                                'Replication info: {repl}'.format(repl=replication))
+            continue
 
         if replication['sbm'] < catch_up_sbm:
             log.info('Replication computed seconds behind master {sbm} < '
                      '{catch_up_sbm}, which is "good enough".'
-                     'Full replication info: {repl}'.format(sbm=replication['sbm'],
-                                                            catch_up_sbm=catch_up_sbm,
-                                                            repl=replication))
-            break
-        else:
-            if last_sbm:
-                catch_up_rate = (last_sbm - replication['sbm']) / sleep_duration
-                if catch_up_rate > 0:
-                    remaining_time = datetime.timedelta(seconds=((replication['sbm'] - catch_up_sbm) / catch_up_rate))
+                     ''.format(sbm=replication['sbm'],
+                               catch_up_sbm=catch_up_sbm))
+            return
+
+        # last_sbm is set at the end of the first execution and should always
+        # be set from then on
+        if last_sbm:
+            catch_up_rate = (last_sbm - replication['sbm']) / float(sleep_duration)
+            if catch_up_rate > 0:
+                remaining_time = datetime.timedelta(seconds=((replication['sbm'] - catch_up_sbm) / catch_up_rate))
+                if remaining_time.total_seconds() > 6 * 60 * 60:
+                    sleep_duration = 5 * 60
+                elif remaining_time.total_seconds() > 60 * 60:
+                    sleep_duration = 60
                 else:
-                    remaining_time = '> heat death of the universe'
+                    sleep_duration = 5
+            else:
+                remaining_time = '> heat death of the universe'
+                sleep_duration = 60
             log.info('Replication is lagged by {sbm} seconds, waiting '
                      'for < {catch_up}. Guestimate time to catch up: {eta}'
                      ''.format(sbm=replication['sbm'],
                                catch_up=catch_up_sbm,
                                eta=str(remaining_time)))
-            last_sbm = replication['sbm']
-            if last_sbm > 24 * 60 * 60:
-                sleep_duration = 5 * 60
-            elif last_sbm > 60 * 60:
-                sleep_duration = 60
-            else:
-                sleep_duration = 5
-            time.sleep(sleep_duration)
+        else:
+            # first time through
+            log.info('Replication is lagged by {sbm} seconds.'
+                     ''.format(sbm=replication['sbm']))
+
+        last_sbm = replication['sbm']
+        time.sleep(sleep_duration)
+
+
+def assert_replication_unlagged(instance, lag_tolerance, dead_master=False):
+    """ Confirm that replication lag is less than tolerance, otherwise
+        throw an exception
+
+    Args:
+    instance - A hostAddr object of the replica
+    lag_tolerance - Possibly values (constants):
+                    'REPLICATION_TOLERANCE_NONE'- no lag is acceptable
+                    'REPLICATION_TOLERANCE_NORMAL' - replica can be slightly lagged
+                    'REPLICATION_TOLERANCE_LOOSE' - replica can be really lagged
+    """
+    # Test to see if the slave is setup for replication. If not, we are hosed
+    replication = calc_slave_lag(instance, dead_master)
+    problems = set()
+    if lag_tolerance == REPLICATION_TOLERANCE_NONE:
+        if replication['sql_bytes'] != 0:
+            problems.add('Replica {r} is not fully synced, bytes behind: {b}'
+                         ''.format(r=instance,
+                                   b=replication['sql_bytes']))
+    elif lag_tolerance == REPLICATION_TOLERANCE_NORMAL:
+        if replication['sbm'] > NORMAL_HEARTBEAT_LAG:
+            problems.add('Replica {r} has heartbeat lag {sbm} > {sbm_limit} seconds'
+                         ''.format(sbm=replication['sbm'],
+                                   sbm_limit=NORMAL_HEARTBEAT_LAG,
+                                   r=instance))
+
+        if replication['io_bytes'] > NORMAL_IO_LAG:
+            problems.add('Replica {r} has IO lag {io_bytes} > {io_limit} bytes'
+                         ''.format(io_bytes=replication['io_bytes'],
+                                   io_limit=NORMAL_IO_LAG,
+                                   r=instance))
+    elif lag_tolerance == REPLICATION_TOLERANCE_LOOSE:
+        if replication['sbm'] > LOOSE_HEARTBEAT_LAG:
+            problems.addi('Replica {r} has heartbeat lag {sbm} > {sbm_limit} seconds'
+                          ''.format(sbm=replication['sbm'],
+                                    sbm_limit=LOOSE_HEARTBEAT_LAG,
+                                    r=instance))
+    else:
+        problems.add('Unkown lag_tolerance mode: {m}'.format(m=lag_tolerance))
+
+    if problems:
+        raise Exception(', '.join(problems))
+
+
+def assert_replication_sanity(instance,
+                              checks=ALL_REPLICATION_CHECKS):
+    """ Confirm that a replica has replication running and from the correct
+        source if the replica is in zk. If not, throw an exception.
+
+    args:
+    instance - A hostAddr object
+    """
+    problems = set()
+    slave_status = get_slave_status(instance)
+    if (CHECK_IO_THREAD in checks and
+            slave_status['Slave_IO_Running'] != 'Yes'):
+        problems.add('Replica {r} has IO thread not running'
+                     ''.format(r=instance))
+
+    if (CHECK_SQL_THREAD in checks and
+            slave_status['Slave_SQL_Running'] != 'Yes'):
+        problems.add('Replcia {r} has SQL thread not running'
+                     ''.format(r=instance))
+
+    if CHECK_CORRECT_MASTER in checks:
+        zk = host_utils.MysqlZookeeper()
+        try:
+            (replica_set, replica_type) = zk.get_replica_set_from_instance(instance)
+        except:
+            # must not be in zk, returning
+            return
+        expected_master = zk.get_mysql_instance_from_replica_set(replica_set)
+        actual_master = host_utils.HostAddr(':'.join((slave_status['Master_Host'],
+                                                      str(slave_status['Master_Port']))))
+        if expected_master != actual_master:
+            problems.add('Master is {actual} rather than expected {expected}'
+                         'for replica {r}'.format(actual=actual_master,
+                                                  expected=expected_master,
+                                                  r=instance))
+
+    if problems:
+        raise Exception(', '.join(problems))
 
 
 def calc_slave_lag(slave_hostaddr, dead_master=False):
-    """Determine MySQL replication lag in bytes and binlogs
+    """ Determine MySQL replication lag in bytes and binlogs
 
     Args:
-    slave_hostaddr - object of host:port for the replica
+    slave_hostaddr - A HostAddr object for a replica
 
     Returns:
     io_binlogs - Number of undownloaded binlogs. This is only slightly useful
@@ -901,18 +1154,18 @@ def calc_slave_lag(slave_hostaddr, dead_master=False):
                   'Master_Host': INVALID,
                   'Master_Port': INVALID}}
     try:
-        slave_conn = connect_mysql(slave_hostaddr)
+        ss = get_slave_status(slave_hostaddr)
+    except ReplicationError:
+        # Not a slave, so return dict of INVALID
+        return ret
     except MySQLdb.OperationalError as detail:
         (error_code, msg) = detail.args
         if error_code == MYSQL_ERROR_CONN_HOST_ERROR:
+            # Host down, but exists.
             return ret
         else:
+            # Host does not exist or something else funky
             raise
-
-    try:
-        ss = get_slave_status(slave_conn)
-    except ReplicationError:
-        return ret
 
     ret['ss'] = ss
     slave_sql_pos = ss['Exec_Master_Log_Pos']
@@ -926,8 +1179,7 @@ def calc_slave_lag(slave_hostaddr, dead_master=False):
                                                     str(ss['Master_Port']))))
     if not dead_master:
         try:
-            master_conn = connect_mysql(master_hostaddr)
-            master_logs = get_master_logs(master_conn)
+            master_logs = get_master_logs(master_hostaddr)
 
             (ret['sql_bytes'], ret['sql_binlogs']) = calc_binlog_behind(slave_sql_binlog_num,
                                                                         slave_sql_pos,
@@ -942,7 +1194,7 @@ def calc_slave_lag(slave_hostaddr, dead_master=False):
             # we can compute real lag because the master is dead
 
     try:
-        ret['sbm'] = calc_alt_sbm(slave_conn, ss)
+        ret['sbm'] = calc_alt_sbm(slave_hostaddr, ss['Master_Server_Id'])
     except MySQLdb.ProgrammingError as detail:
         (error_code, msg) = detail.args
         if error_code != MYSQL_ERROR_NO_SUCH_TABLE:
@@ -953,22 +1205,25 @@ def calc_slave_lag(slave_hostaddr, dead_master=False):
     return ret
 
 
-def calc_alt_sbm(conn, slave_status):
+def calc_alt_sbm(instance, master_server_id):
     """ Calculate seconds behind using heartbeat + time on slave server
 
     Args:
-    conn - a connection to the MySQL instance
-    slave_status - a dict of slave status
+    instance - A hostAddr object of a slave server
+    master_server_id - The server_id of the master server
 
     Returns:
     An int of the calculated seconds behind master or None
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     sql = ''.join(("SELECT TIMESTAMPDIFF(SECOND,ts, NOW()) AS 'sbm' "
                    "FROM {METADATA_DB}.heartbeat "
                    "WHERE server_id= %(Master_Server_Id)s"))
 
-    cursor.execute(sql.format(METADATA_DB=METADATA_DB), slave_status)
+    cursor.execute(sql.format(METADATA_DB=METADATA_DB),
+                   {'Master_Server_Id': master_server_id})
     row = cursor.fetchone()
     if row:
         return row['sbm']
@@ -976,24 +1231,78 @@ def calc_alt_sbm(conn, slave_status):
         return None
 
 
-def set_global_variable(conn, variable, value):
+def get_heartbeat(instance):
+    """ Get the most recent heartbeat on a slave
+
+    Args:
+    instance - A hostAddr object of a slave server
+
+    Returns:
+    A datetime.datetime object.
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    slave_status = get_slave_status(instance)
+    sql = ''.join(("SELECT ts "
+                   "FROM {METADATA_DB}.heartbeat "
+                   "WHERE server_id= %(Master_Server_Id)s"))
+
+    cursor.execute(sql.format(METADATA_DB=METADATA_DB), slave_status)
+    row = cursor.fetchone()
+    if not row:
+        return None
+
+    return datetime.datetime.strptime(row['ts'], MYSQL_DATETIME_TO_PYTHON)
+
+
+def get_pitr_data(instance):
+    """ Get all data needed to run a point in time recovery later on
+
+    Args:
+    instance - A hostAddr object of a server
+
+    Returns:
+    """
+    ret = dict()
+    ret['heartbeat'] = str(get_heartbeat(instance))
+    ret['repl_positions'] = []
+    master_status = get_master_status(instance)
+    ret['repl_positions'].append((master_status['File'], master_status['Position']))
+    if 'Executed_Gtid_Set' in master_status:
+        ret['Executed_Gtid_Set'] = master_status['Executed_Gtid_Set']
+    else:
+        ret['Executed_Gtid_Set'] = None
+
+    try:
+        ss = get_slave_status(instance)
+        ret['repl_positions'].append((ss['Relay_Master_Log_File'], ss['Exec_Master_Log_Pos']))
+    except ReplicationError:
+        # we are running on a master, don't care about this exception
+        pass
+
+    return ret
+
+
+def set_global_variable(instance, variable, value):
     """ Modify MySQL global variables
 
     Args:
-    conn - a connection to the MySQL instance
+    instance - a hostAddr object
     variable - a string the MySQL global variable name
     value - a string or bool of the deisred state of the variable
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
 
     # If we are enabling read only we need to kill all long running trx
     # so that they don't block the change
     if (variable == 'read_only' or variable == 'super_read_only') and value:
-        gvars = get_global_variables(conn)
+        gvars = get_global_variables(instance)
         if 'super_read_only' in gvars and gvars['super_read_only'] == 'ON':
             # no use trying to set something that is already turned on
             return
-        kill_long_trx(conn)
+        kill_long_trx(instance)
 
     parameters = {'value': value}
     # Variable is not a string and can not be paramaretized as per normal
@@ -1002,15 +1311,34 @@ def set_global_variable(conn, variable, value):
     log.info(cursor._executed)
 
 
-def get_long_trx(conn):
+def start_consistent_snapshot(conn, read_only=False):
+    """ Start a transaction with a consistent view of data
+
+    Args:
+    instance - a hostAddr object
+    read_only - see the transaction to be read_only
+    """
+    if read_only:
+        read_write_mode = 'READ ONLY'
+    else:
+        read_write_mode = 'READ WRITE'
+    cursor = conn.cursor()
+    cursor.execute("SET SESSION TRANSACTION ISOLATION "
+                   "LEVEL REPEATABLE READ")
+    cursor.execute("START TRANSACTION /*!50625 WITH CONSISTENT SNAPSHOT, {rwm} */".format(rwm=read_write_mode))
+
+
+def get_long_trx(instance):
     """ Get the thread id's of long (over 2 sec) running transactions
 
     Args:
-    conn - A mysql connection
+    instance - a hostAddr object
 
     Returns -  A set of thread_id's
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
+
     sql = ('SELECT trx_mysql_thread_id '
            'FROM information_schema.INNODB_TRX '
            'WHERE trx_started < NOW() - INTERVAL 2 SECOND ')
@@ -1023,14 +1351,35 @@ def get_long_trx(conn):
     return threads
 
 
-def kill_long_trx(conn):
+def kill_user_queries(instance, username):
+    """ Kill a users queries
+
+    Args:
+    instance - The instance on which to kill the queries
+    username - The name of the user to kill
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    sql = ("SELECT id "
+           "FROM information_schema.processlist "
+           "WHERE user= %(username)s ")
+    cursor.execute(sql, {'username': username})
+    queries = cursor.fetchall()
+    for query in queries:
+        log.info("Killing connection id {id}".format(id=query['id']))
+        cursor.execute("kill %(id)s", {'id': query['id']})
+
+
+def kill_long_trx(instance):
     """ Kill long running transaction.
 
     Args:
-    conn - A mysql connection
+    instance - a hostAddr object
     """
+    conn = connect_mysql(instance)
     cursor = conn.cursor()
-    threads_to_kill = get_long_trx(conn)
+
+    threads_to_kill = get_long_trx(instance)
     for thread in threads_to_kill:
         try:
             sql = 'kill %(thread)s'
@@ -1046,7 +1395,7 @@ def kill_long_trx(conn):
 
     log.info('Confirming that long running transactions have gone away')
     while True:
-        long_threads = get_long_trx(conn)
+        long_threads = get_long_trx(instance)
         not_dead = threads_to_kill.intersection(long_threads)
 
         if not_dead:
@@ -1086,45 +1435,6 @@ def get_mysqlops_connections():
     return connect_mysql(reporting, 'scriptrw')
 
 
-def get_mysql_backups(conn, instance, date, bu_type='xbstream'):
-    """  Get a logged mysql backup by instance and date
-
-    Args:
-        conn - A connection to the restorting instance
-        instance - a hostaddr object
-        date - the date to look for a backup
-        bu_type - either 'sql' or 'xbstream', default 'xbstream'
-
-    Returns:
-        A backup file or None. We explicitly do not differentiate between
-        a single valid backup and multiple.
-
-    Example:
-        [u'mysql-abexperimentsdb001b-3306-2014-02-08.tar.gz',
-         u'mysql-abexperimentsdb001b-3306-2014-02-09.tar.gz',
-         u'mysql-abexperimentsdb001b-3306-2014-02-10.tar.gz',
-         ...
-    """
-    params = {'hostname': instance.hostname,
-              'port': instance.port,
-              'backup_type': bu_type,
-              'start': ''.join((date, ' 00:00:00')),
-              'end': ''.join((date, ' 23:59:59'))}
-    sql = ('SELECT filename '
-           'FROM mysqlops.mysql_backups '
-           'WHERE hostname = %(hostname)s '
-           '      AND port = %(port)s '
-           '      AND backup_type = %(backup_type)s'
-           '      AND finished BETWEEN %(start)s and %(end)s')
-    cursor = conn.cursor()
-    cursor.execute(sql, params)
-    ret = cursor.fetchone()
-    if ret:
-        return ret['filename']
-    else:
-        return None
-
-
 def start_backup_log(instance, backup_type, timestamp):
     """ Start a log of a mysql backup
 
@@ -1160,12 +1470,11 @@ def start_backup_log(instance, backup_type, timestamp):
     return row_id
 
 
-def finalize_backup_log(id, filename, size):
+def finalize_backup_log(id, filename):
     """ Write final details of a mysql backup
 
     id - A pk from the mysql_backups table
     filename - The location of the resulting backup
-    size -  The size of the compressed backup
     """
     try:
         reporting_conn = get_mysqlops_connections()
@@ -1173,12 +1482,10 @@ def finalize_backup_log(id, filename, size):
         sql = ("UPDATE mysqlops.mysql_backups "
                "SET "
                "filename = %(filename)s, "
-               "finished = %(finished)s, "
-               "size = %(size)s "
+               "finished = %(finished)s "
                "WHERE id = %(id)s")
         metadata = {'filename': filename,
                     'finished': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'size': size,
                     'id': id}
         cursor.execute(sql, metadata)
         reporting_conn.commit()

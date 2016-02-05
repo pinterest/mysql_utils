@@ -12,8 +12,6 @@ from lib import mysql_lib
 from lib import host_utils
 from lib import environment_specific
 
-MAX_ALIVE_MASTER_SLAVE_LAG_SECONDS = 60
-MAX_DEAD_MASTER_SLAVE_LAG_SECONDS = 3600
 MAX_ZK_WRITE_ATTEMPTS = 5
 WAIT_TIME_CONFIRM_QUIESCE = 10
 
@@ -106,29 +104,19 @@ def mysql_failover(master, dry_run, skip_lock,
         else:
             replicas = set([slave])
 
-        # let's make sure that what we think is the master, actually is
-        confirm_replica_topology(master, replicas)
-
         # We use master_conn as a mysql connection to the master server, if
         # it is False, the master is dead
         if trust_me_its_dead:
             master_conn = None
         else:
             master_conn = is_master_alive(master, replicas)
-        slave_conn = mysql_lib.connect_mysql(slave)
 
         # Test to see if the slave is setup for replication. If not, we are hosed
         log.info('Testing to see if Slave/new master is setup to write '
                  'replication logs')
-        try:
-            mysql_lib.get_master_status(slave_conn)
-        except mysql_lib.ReplicationError:
-            log.error('New master {slave} is not setup to write replicaiton '
-                      'logs!'.format(slave=slave))
-            raise
-        log.info('Slave/new master is setup to write replication logs')
+        mysql_lib.get_master_status(slave)
 
-        if kill_old_master:
+        if kill_old_master and not dry_run:
             log.info('Killing old master, we hope you know what you are doing')
             mysql_lib.shutdown_mysql(master)
             master_conn = None
@@ -136,13 +124,15 @@ def mysql_failover(master, dry_run, skip_lock,
         if master_conn:
             log.info('Master is considered alive')
             dead_master = False
-            confirm_max_replica_lag(replicas, MAX_ALIVE_MASTER_SLAVE_LAG_SECONDS,
-                                    dead_master=dead_master)
+            confirm_max_replica_lag(replicas,
+                                    mysql_lib.REPLICATION_TOLERANCE_NORMAL,
+                                    dead_master)
         else:
             log.info('Master is considered dead')
             dead_master = True
-            confirm_max_replica_lag(replicas, MAX_DEAD_MASTER_SLAVE_LAG_SECONDS,
-                                    dead_master=dead_master)
+            confirm_max_replica_lag(replicas,
+                                    mysql_lib.REPLICATION_TOLERANCE_LOOSE,
+                                    dead_master)
 
         if dry_run:
             log.info('In dry_run mode, so exiting now')
@@ -153,17 +143,19 @@ def mysql_failover(master, dry_run, skip_lock,
 
         if master_conn:
             log.info('Setting read_only on master')
-            mysql_lib.set_global_variable(master_conn, 'read_only', True)
+            mysql_lib.set_global_variable(master, 'read_only', True)
             log.info('Confirming no writes to old master')
             # If there are writes with the master in read_only mode then the
             # promotion can not proceed.
             # A likely reason is a client has the SUPER privilege.
-            confirm_no_writes(master_conn)
+            confirm_no_writes(master)
             log.info('Waiting for replicas to be caught up')
-            confirm_max_replica_lag(replicas, 0,
-                                    timeout=MAX_ALIVE_MASTER_SLAVE_LAG_SECONDS,
-                                    dead_master=dead_master)
-            log.info('Setting up replication from old master ({master})'
+            confirm_max_replica_lag(replicas,
+                                    mysql_lib.REPLICATION_TOLERANCE_NONE,
+                                    dead_master,
+                                    True,
+                                    mysql_lib.NORMAL_HEARTBEAT_LAG)
+            log.info('Setting up replication from old master ({master}) '
                      'to new master ({slave})'.format(master=master,
                                                       slave=slave))
             mysql_lib.setup_replication(new_master=slave, new_replica=master)
@@ -175,22 +167,23 @@ def mysql_failover(master, dry_run, skip_lock,
 
             log.info('Confirming replica has processed all replication '
                      ' logs')
-            confirm_no_writes(slave_conn)
+            confirm_no_writes(slave)
             log.info('Looks like no writes being processed by replica via '
                      'replication or other means')
             if len(replicas) > 1:
-                log.info('Confirming relpica servers in sync')
-                confirm_max_replica_lag(replicas, MAX_DEAD_MASTER_SLAVE_LAG_SECONDS,
-                                        replicas_synced=True,
-                                        dead_master=dead_master)
+                log.info('Confirming replica servers are synced')
+                confirm_max_replica_lag(replicas,
+                                        mysql_lib.REPLICATION_TOLERANCE_LOOSE,
+                                        dead_master,
+                                        True)
     except:
         log.info('Starting rollback')
         if master_conn:
             log.info('Releasing read_only on old master')
-            mysql_lib.set_global_variable(master_conn, 'read_only', False)
+            mysql_lib.set_global_variable(master, 'read_only', False)
 
             log.info('Clearing replication settings on old master')
-            mysql_lib.reset_slave(master_conn)
+            mysql_lib.reset_slave(master)
         if lock_identifier:
             log.info('Releasing promotion lock')
             release_promotion_lock(lock_identifier)
@@ -220,14 +213,28 @@ def mysql_failover(master, dry_run, skip_lock,
                 zk_write_attempt = zk_write_attempt+1
 
     log.info('Removing read_only from new master')
-    mysql_lib.set_global_variable(slave_conn, 'read_only', False)
+    mysql_lib.set_global_variable(slave, 'read_only', False)
     log.info('Removing replication configuration from new master')
-    mysql_lib.reset_slave(slave_conn)
+    mysql_lib.reset_slave(slave)
     if lock_identifier:
         log.info('Releasing promotion lock')
         release_promotion_lock(lock_identifier)
 
     log.info('Failover complete')
+
+    # we don't really care if this fails, but we'll print a message anyway.
+    try:
+        environment_specific.generic_json_post(
+            environment_specific.CHANGE_FEED_URL,
+            {'type': 'MySQL Failover',
+             'environment': replica_set,
+             'description': "Failover from {m} to {s}".format(m=master, s=slave),
+             'author': host_utils.get_user(),
+             'automation': False,
+             'source': "mysql_failover.py on {}".format(host_utils.HOSTNAME)})
+    except Exception as e:
+        log.warning("Failover completed, but change feed "
+                    "not updated: {}".format(e))
 
     if not master_conn:
         log.info('As master is dead, will try to launch a replacement. Will '
@@ -347,31 +354,7 @@ def release_promotion_lock(lock_identifier):
     log.info(cursor._executed)
 
 
-def confirm_replica_topology(master, replicas):
-    """ Confirm that replica servers are actually replicating off of a master
-
-    Args:
-    master - A hostaddr object for the master instance
-    replicas - A set of hostaddr objects for the replica instance
-    """
-    for replica in replicas:
-        conn = mysql_lib.connect_mysql(replica)
-        ss = mysql_lib.get_slave_status(conn)
-        repl_master = host_utils.HostAddr(':'.join((ss['Master_Host'],
-                                                    str(ss['Master_Port']))))
-        if repl_master != master:
-            raise Exception('Slave {replica} is not a replica of master '
-                            '{master}, but is instead a replica of '
-                            '{repl_master}'.format(replica=replica,
-                                                   repl_master=repl_master,
-                                                   master=master))
-        else:
-            log.info('Replica {replica} is replicating from expected master '
-                     'server {master}'.format(replica=replica,
-                                              master=master))
-
-
-def confirm_max_replica_lag(replicas, max_lag, dead_master,
+def confirm_max_replica_lag(replicas, lag_tolerance, dead_master,
                             replicas_synced=False, timeout=0):
     """ Test replication lag
 
@@ -385,64 +368,43 @@ def confirm_max_replica_lag(replicas, max_lag, dead_master,
                       position in the binary log.
     timeout - How long to wait for replication to be in the desired state
     """
-    repl_checks = dict()
     start = time.time()
+    if dead_master:
+        replication_checks = set([mysql_lib.CHECK_SQL_THREAD,
+                                  mysql_lib.CHECK_CORRECT_MASTER])
+    else:
+        replication_checks = mysql_lib.ALL_REPLICATION_CHECKS
+
     while True:
         acceptable = True
         for replica in replicas:
-            repl_check = mysql_lib.calc_slave_lag(replica, dead_master=dead_master)
-            repl_checks[replica.__str__()] = ':'.join((repl_check['ss']['Relay_Master_Log_File'],
-                                                       str(repl_check['ss']['Exec_Master_Log_Pos'])))
-            # Basic sanity
-            if repl_check['sbm'] is None:
-                raise Exception('Computed replication is unavailible for {replica}, '
-                                'perhaps restart pt-heartbeat '
-                                'on the master?'.format(replica=replica))
-
-            if repl_check['ss']['Slave_SQL_Running'] != 'Yes':
-                log.info('SQL thread is not running, trying to restart, then '
+            # Confirm threads are running, expected master
+            try:
+                mysql_lib.assert_replication_sanity(replica, replication_checks)
+            except Exception as e:
+                log.warning(e)
+                log.info('Trying to restart replication, then '
                          'sleep 20 seconds')
-                conn = mysql_lib.connect_mysql(replica)
-                mysql_lib.restart_replication(conn)
+                mysql_lib.restart_replication(replica)
                 time.sleep(20)
-                repl_check = mysql_lib.calc_slave_lag(replica, dead_master=dead_master)
-                if repl_check['ss']['Slave_SQL_Running'] != 'Yes':
-                    raise Exception('SQL thread on {replica} has serious '
-                                    'problems'.format(replica=replica))
+                mysql_lib.assert_replication_sanity(replica, replication_checks)
 
-            if max_lag == 0:
-                if repl_check['sql_bytes'] != 0:
-                    acceptable = False
-                    log.warn('Unprocessed log on {replica} is {sql_bytes} '
-                             'bytes  > 0'
-                             ''.format(replica=replica,
-                                       sql_bytes=repl_check['sql_bytes']))
-                else:
-                    log.info('{replica} is in sync with the '
-                             'master'.format(replica=replica))
-            else:
-                if repl_check['sbm'] > max_lag:
-                    acceptable = False
-                    log.warn('Lag on {replica} is {lag} seconds is greater '
-                             'than limit of '
-                             '{limit}'.format(replica=replica,
-                                              limit=max_lag,
-                                              lag=repl_check['sbm']))
-                else:
-                    log.info('Lag on {replica} is {lag} is <= limit of '
-                             '{limit}'.format(replica=replica,
-                                              limit=max_lag,
-                                              lag=repl_check['sbm']))
+            try:
+                mysql_lib.assert_replication_unlagged(replica, lag_tolerance, dead_master)
+            except Exception as e:
+                log.warning(e)
+                acceptable = False
 
-        if replicas_synced and len(set(repl_checks.values())) != 1:
+        if replicas_synced and not confirm_replicas_in_sync(replicas):
             acceptable = False
-            raise Exception('Replica servers are not in sync and replicas_synced '
-                            'is set. Replication status: '
-                            '{repl_checks}'.format(repl_checks=repl_checks))
+            log.warning('Replica servers are not in sync and replicas_synced '
+                        'is set')
+
         if acceptable:
             return
         elif (time.time() - start) > timeout:
-            raise Exception('Replication is not in an acceptable state')
+            raise Exception('Replication is not in an acceptable state on '
+                            'replica {r}'.format(r=replica))
         else:
             log.info('Sleeping for 5 second to allow replication to catch up')
             time.sleep(5)
@@ -489,36 +451,37 @@ def is_master_alive(master, replicas):
 
     # We can not get a connection to the master, so poll the replica servers
     for replica in replicas:
-        conn = mysql_lib.connect_mysql(replica)
         # If replication has not hit a timeout, a dead master can still have
         # a replica which thinks it is ok. "STOP SLAVE; START SLAVE" followed
         # by a sleep will get us truthyness.
-        mysql_lib.restart_replication(conn)
-        ss = mysql_lib.get_slave_status(conn)
-        if ss['Slave_IO_Running'] == 'Yes':
+        mysql_lib.restart_replication(replica)
+        try:
+            mysql_lib.assert_replication_sanity(replica)
             raise Exception('Replica {replica} thinks it can connect to '
                             'master {master}, but failover script can not. '
                             'Possible network partition!'
                             ''.format(replica=replica,
                                       master=master))
-        else:
-            log.info('Replica {replica} also can not connect to master '
-                     '{master}.'.format(replica=replica,
-                                        master=master))
+        except:
+            # The exception is expected in this case
+            pass
+        log.info('Replica {replica} also can not connect to master '
+                 '{master}.'.format(replica=replica,
+                                    master=master))
     return False
 
 
-def confirm_no_writes(conn):
+def confirm_no_writes(instance):
     """ Confirm that a server is not receiving any writes
 
     Args:
     conn - A mysql connection
     """
-    mysql_lib.enable_and_flush_activity_statistics(conn)
+    mysql_lib.enable_and_flush_activity_statistics(instance)
     log.info('Waiting {length} seconds to confirm instance is no longer '
              'accepting writes'.format(length=WAIT_TIME_CONFIRM_QUIESCE))
     time.sleep(WAIT_TIME_CONFIRM_QUIESCE)
-    db_activity = mysql_lib.get_dbs_activity(conn)
+    db_activity = mysql_lib.get_dbs_activity(instance)
 
     active_db = set()
     for db in db_activity:
@@ -530,6 +493,25 @@ def confirm_no_writes(conn):
                         'no activity'.format(dbs=active_db))
 
     log.info('No writes after sleep, looks like we are good to go')
+
+
+def confirm_replicas_in_sync(replicas):
+    """ Confirm that all replicas are in sync in terms of replication
+
+    Args:
+    replicas - A set of hostAddr objects
+    """
+    replication_progress = set()
+    for replica in replicas:
+        slave_status = mysql_lib.get_slave_status(replica)
+        replication_progress.add(':'.join((slave_status['Relay_Master_Log_File'],
+                                           str(slave_status['Exec_Master_Log_Pos']))))
+
+    if len(replication_progress) == 1:
+        return True
+    else:
+        return False
+
 
 if __name__ == "__main__":
     log = environment_specific.setup_logging_defaults(__name__)

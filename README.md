@@ -74,6 +74,9 @@ A list of included utilities:
 This script backs up MySQL replication logs in order to be able to perform
 point-in-time recoveries in the case where all servers in a replica set are
 lost. All logs up to the current log being written to are uploaded to S3.
+  - **binlog_rotator.py**
+If the current binlog has been in use longer than a predefined limit, rotate
+it.
   - **check_mysql_replication.py**
 This script displays replication status of an instance in terms of sql/io
 thread status and bytes behind, a computed seconds behind master based on
@@ -92,6 +95,8 @@ eventually drop the unused shards.
   - **get_recent_checksums.py**
 Use data populated by mysql_checksum.py to display current replication
 consistency data.
+  - **kill_backups.py**
+Kill any running backups. This is run by cron on master servers.
   - **launch_amazon_mysql_server.py**
 This script is generally called by launch_replacement_db_host.py and provides
 an easy interface to correctly launch a new server in aws.
@@ -108,6 +113,10 @@ display the created backup files. This script only checks xtrabackup backups
   - **mysql_backup.py**
 This script is the entry point for backups for MySQL. It can perform logical
 and xtrabackup backups.
+  - **mysql_backup_csv.py**
+This script backups up data to S3 in CSV format in a manner that can be
+queried by Hive like systems. It is **very** much multiprocess and
+multithreaded and doubles as a stress testing utility.
   - **mysql_backup_logical.py**
 This script is basically shorthand for running a logical backup through
 mysql_backup.py.
@@ -156,12 +165,14 @@ launch_replacement_db_host.py.
   - **mysql_shard_status.py**
 This script displays the status in service discovery of an instance. Primarily
 used for gating cron jobs.
-  - **purge_mysql_backups.py**
-This script purges backup files on local disk, but takes no action on backups
-in S3. 
+  - **other_slave_running_etl.py**
+Checks is another slave server is running a csv backup. Useful for gating cron.
   - **retirement_queue.py**
 This script ensures that a server which is no longer in service discovery
 is no longer in use and then terminates the instance.
+  - **safe_uploader.py**
+This module provides our canonical way to upload data into S3. Either the 
+processes feeding in data all succeed or the upload is not finalized.
   - **schema_verifier.py**
 This script ensures that schema is in sync across sharded data sets.
 

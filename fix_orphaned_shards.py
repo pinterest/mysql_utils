@@ -56,9 +56,8 @@ drop - This should be run a few days after a rename. Drop the empty original
     if args.action == 'rename':
         rename_db_to_drop(instance, dbs, args.verbose, args.dry_run)
     elif args.action == 'revert_rename':
-        conn = mysql_lib.connect_mysql(instance)
         for db in dbs:
-            mysql_lib.move_db_contents(conn=conn,
+            mysql_lib.move_db_contents(instance,
                                        old_db=''.join((DB_PREPEND, db)),
                                        new_db=db,
                                        verbose=args.verbose,
@@ -117,8 +116,8 @@ def rename_db_to_drop(instance, dbs, verbose=False, dry_run=False):
 
         # We should be safe to create the new db and rename
         if not dry_run:
-            mysql_lib.create_db(conn, renamed_db)
-        mysql_lib.move_db_contents(conn=conn,
+            mysql_lib.create_db(instance, renamed_db)
+        mysql_lib.move_db_contents(instance,
                                    old_db=db,
                                    new_db=renamed_db,
                                    verbose=verbose,
@@ -145,14 +144,14 @@ def drop_db_after_rename(instance, dbs, verbose, dry_run):
         sys.exit(1)
 
     # make sure the original db is empty
-    conn = mysql_lib.connect_mysql(instance)
-    cursor = conn.cursor()
     for db in dbs:
-        if mysql_lib.get_tables(conn, db):
+        if mysql_lib.get_tables(instance, db):
             print ''.join(("Cowardly refusing to drop non-empty db:",
                            db))
             sys.exit(1)
 
+    conn = mysql_lib.connect_mysql(instance)
+    cursor = conn.cursor()
     for db in dbs:
         # we should be good to drop the old empty dbs
         raw_sql = 'DROP DATABASE IF EXISTS `{db}`;'

@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 import argparse
-import os
 import time
 
-import purge_mysql_backups
 from lib import backup
 from lib import environment_specific
 from lib import host_utils
@@ -34,6 +32,17 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM):
     Args:
     instance - A hostaddr object
     """
+    log.info('Confirming sanity of replication (if applicable)')
+    zk = host_utils.MysqlZookeeper()
+    try:
+        (_, replica_type) = zk.get_replica_set_from_instance(instance)
+    except:
+        # instance is not in production
+        replica_type = None
+
+    if replica_type and replica_type != host_utils.REPLICA_ROLE_MASTER:
+        mysql_lib.assert_replication_sanity(instance)
+
     log.info('Logging initial status to mysqlops')
     start_timestamp = time.localtime()
     lock_handle = None
@@ -45,9 +54,6 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM):
         log.info('Taking backup lock')
         lock_handle = host_utils.take_flock_lock(backup.BACKUP_LOCK_FILE)
 
-        log.info('Cleaning up old backups')
-        purge_mysql_backups.purge_mysql_backups(instance, skip_lock=True)
-
         # Actually run the backup
         log.info('Running backup')
         if backup_type == backup.BACKUP_TYPE_XBSTREAM:
@@ -57,11 +63,6 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM):
         else:
             raise Exception('Unsupported backup type {backup_type}'
                             ''.format(backup_type=backup_type))
-
-        # Upload file to s3
-        log.info('Uploading file to s3')
-        backup.s3_upload(backup_file)
-
     finally:
         if lock_handle:
             log.info('Releasing lock')
@@ -70,15 +71,10 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM):
     # Update database with additional info now that backup is done.
     if backup_id:
         log.info("Updating database log entry with final backup info")
-        mysql_lib.finalize_backup_log(backup_id, backup_file,
-                                      size=os.stat(backup_file).st_size)
+        mysql_lib.finalize_backup_log(backup_id, backup_file)
     else:
         log.info("The backup is complete, but we were not able to "
                  "write to the central log DB.")
-
-    # Running purge again
-    log.info('Purging backups again')
-    purge_mysql_backups.purge_mysql_backups(instance)
 
 
 if __name__ == "__main__":

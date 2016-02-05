@@ -163,8 +163,8 @@ def launch_replacement_db_host(original_server,
                                 'replacement already exists.')
             else:
                 log.info("A replacement already exists, but was launched "
-                         "{days} ago. The timeout for servers builds is "
-                         "{timeout} so we are automatically setting "
+                         "{days} days ago. The timeout for servers builds is "
+                         "{timeout} days so we are automatically setting "
                          "replace_again.".format(days=age_of_replacement.days,
                                                  timeout=SERVER_BUILD_TIMEOUT))
                 replace_again = True
@@ -246,12 +246,11 @@ def launch_replacement_db_host(original_server,
         reasons.add('hardware failure')
 
     if not dead_server:
-        slave_status = mysql_lib.calc_slave_lag(original_server)
-        if slave_status['ss']['Slave_SQL_Running'] != 'Yes':
-            reasons.add('sql replication thread broken')
-
-        if slave_status['ss']['Slave_IO_Running'] != 'Yes':
-            reasons.add('io replication thread broken')
+        try:
+            mysql_lib.assert_replication_sanity(original_server)
+        except Exception as e:
+            log.info('Replication problem: {e}'.format(e=e))
+            reasons.add('replication broken')
 
     # If we get to here and there is no reason, bail out
     if not reasons and not replacement_config['dry_run']:
@@ -453,14 +452,13 @@ def get_master_mysql_major_version(instance):
     master = zk.get_mysql_instance_from_replica_set(instance.get_zk_replica_set()[0],
                                                     repl_type=host_utils.REPLICA_ROLE_MASTER)
     try:
-        master_conn = mysql_lib.connect_mysql(master)
+        mysql_version = mysql_lib.get_global_variables(master)['version'][:3]
     except _mysql_exceptions.OperationalError:
         raise Exception('Could not connect to master server {instance} in '
                         'order to determine MySQL version to launch with. '
                         'Perhaps run this script from there? This is likely '
                         'due to firewall rules.'
                         ''.format(instance=instance.hostname))
-    mysql_version = mysql_lib.get_global_variables(master_conn)['version'][:3]
     return mysql_version
 
 

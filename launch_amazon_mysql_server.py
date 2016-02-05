@@ -105,7 +105,7 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group, clas
         raise Exception('One and only one of vpc_security_group and '
                         'classic_security_group must be specified. Received:\n'
                         'vpc_security_group: {vpc}, \n'
-                        'classic_security_group: {classic}'
+                        'classic_security_group: {classic_security_group}'
                         ''.format(vpc=vpc_security_group,
                                   classic_security_group=classic_security_group))
 
@@ -124,17 +124,13 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group, clas
                            'pinfo_role: {hiera_config}\n'
                            'hostname: {hostname}\n'
                            'raid: true\n'
-                           'raid_mount: {raid_mount}\n'
-                           'ebs: true\n'
-                           'ebs_size: {ebs_size}\n'
-                           'ebs_mount: {ebs_mount}'
+                           'raid_fs: xfs\n'
+                           'raid_mount: {raid_mount}'
                            ''.format(pinfo_team=environment_specific.PINFO_TEAM,
                                      pinfo_env=environment_specific.PINFO_ENV,
                                      raid_mount=environment_specific.RAID_MOUNT,
-                                     ebs_mount=environment_specific.EBS_MOUNT,
                                      hiera_config=hiera_config,
-                                     hostname=hostname,
-                                     ebs_size=environment_specific.SUPPORTED_HARDWARE[instance_type]['ebs_vol_size']))
+                                     hostname=hostname))
 
     log.info('Config for new server:\n{config}'.format(config=config))
     conn = mysql_lib.get_mysqlops_connections()

@@ -218,8 +218,7 @@ def main():
 
     # If enabled, try to create the table that holds the checksum info.
     # If not enabled, make sure that the table exists.
-    conn = mysql_lib.connect_mysql(instance, 'scriptro')
-    if not mysql_lib.does_table_exist(conn, mysql_lib.METADATA_DB, CHECKSUM_TBL):
+    if not mysql_lib.does_table_exist(instance, mysql_lib.METADATA_DB, CHECKSUM_TBL):
         if args.create_table:
             create_checksum_detail_table(instance)
         else:
@@ -241,17 +240,12 @@ def main():
 
     # before we even start this, make sure replication is OK.
     for slave in slaves:
-        slave_conn = mysql_lib.connect_mysql(slave, 'scriptrw')
-        ss = mysql_lib.get_slave_status(slave_conn)
-        if ss['Slave_SQL_Running'] != "Yes" or ss['Slave_IO_Running'] != "Yes":
-            raise Exception("Replication is NOT RUNNING on slave {s}: "
-                            "SQL: {st} | IO: {it}".format(st=ss['Slave_SQL_Running'],
-                                                          it=ss['Slave_IO_Running']))
+        mysql_lib.assert_replication_sanity(slave)
 
     if args.dbs:
         db_to_check = set(args.dbs.split(','))
     else:
-        dbs = mysql_lib.get_dbs(conn)
+        dbs = mysql_lib.get_dbs(instance)
 
         if args.all:
             db_to_check = dbs
@@ -273,8 +267,7 @@ def main():
     # of a given database.
     #
     for db in db_to_check:
-        conn = mysql_lib.connect_mysql(instance, 'scriptro')
-        tables_to_check = mysql_lib.get_tables(conn, db, skip_views=True)
+        tables_to_check = mysql_lib.get_tables(instance, db, skip_views=True)
         for tbl in tables_to_check:
             c_cmd, c_out, c_err, c_ret = checksum_tbl(instance, db, tbl)
             if not args.quiet:
@@ -388,8 +381,6 @@ def main():
                                          'sync_rc': sync_ret})
 
                         write_checksum_status(instance, data)
-
-        conn.close()
 
 
 # write_checksum_status

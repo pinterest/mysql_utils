@@ -1,6 +1,10 @@
 [mysqld3306]
 thread_handling = pool-of-threads
 thread_pool_size = 36
-max_connections = 15000
+max_connections = 20000
+
+# suggested (not the specific values, but changes from default) by https://bugs.mysql.com/bug.php?id=70209 for low-write workloads
 innodb_io_capacity = 1000
 innodb_io_capacity_max = 2000
+innodb_flushing_avg_loops = 100
+innodb_max_dirty_pages_pct = 40

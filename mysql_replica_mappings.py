@@ -3,7 +3,6 @@ import argparse
 
 from lib import environment_specific
 from lib import host_utils
-from lib import environment_specific
 
 OUTPUT_FORMAT = ('{replica_set:<RS}'
                  '{replica_type:<12}'

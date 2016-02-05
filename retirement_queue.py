@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import logging
 import pprint
 
 import boto.ec2
@@ -20,7 +21,12 @@ IGNORABLE_USERS = set(["admin", "ptkill", "monit",
                        "#mysql_system#", 'ptchecksum',
                        "replicant", "root", "heartbeat", "system user"])
 
-log = environment_specific.setup_logging_defaults(__name__)
+OUTPUT_FORMAT = ('{hostname:<34} '
+                 '{instance_id:<18} '
+                 '{happened:<20} '
+                 '{state}')
+
+log = logging.getLogger(__name__)
 chat_handler = environment_specific.BufferingChatHandler()
 log.addHandler(chat_handler)
 
@@ -41,7 +47,8 @@ def main():
                              'will display what is protected from retirement',
                         choices=['add_to_queue', 'process_mysql_shutdown',
                                  'terminate_instances', 'protect_instance',
-                                 'unprotect_instance', 'get_protected_hosts'])
+                                 'unprotect_instance', 'get_protected_hosts',
+                                 'show_queue'])
     parser.add_argument('--dry_run',
                         help="Don't change any state",
                         action='store_true')
@@ -53,6 +60,13 @@ def main():
                               "add_to_queue and(un)protect_instance and "
                               "optional otherwise"),
                         default=None)
+    parser.add_argument('--skip_production_check',
+                        help=("Allows the retirement of replica sets no "
+                              "longer in use. This flag only effects "
+                              "add_to_queue. After that remove the host "
+                              "zk."),
+                        default=False,
+                        action='store_true')
     args = parser.parse_args()
 
     if args.dry_run:
@@ -62,13 +76,17 @@ def main():
                          args.action == 'unprotect_instance'):
         raise Exception('Dry run is not supported for this action')
 
+    if args.skip_production_check and args.action != 'add_to_queue':
+        raise Exception('skip_production_check is only supported for action '
+                        'add_to_queue.')
+
     log.info('action is {action}'.format(action=args.action))
 
     if args.action == 'add_to_queue':
         if args.hostname is None:
             raise Exception('Arg --hostname is required for action '
                             'add_to_queue')
-        add_to_queue(args.hostname, args.dry_run)
+        add_to_queue(args.hostname, args.dry_run, args.skip_production_check)
     elif args.action == 'process_mysql_shutdown':
         process_mysql_shutdown(args.hostname, args.dry_run)
     elif args.action == 'terminate_instances':
@@ -81,13 +99,15 @@ def main():
         entries = get_protected_hosts()
         if entries:
             pprint.pprint(entries)
+    elif args.action == 'show_queue':
+        show_queue()
 
     else:
         raise Exception('Unexpected action '
                         '{action}'.format(action=args.action))
 
 
-def add_to_queue(hostname, dry_run):
+def add_to_queue(hostname, dry_run, skip_production_check=False):
     """ Add an instance to the retirement queue
 
     Args:
@@ -104,10 +124,15 @@ def add_to_queue(hostname, dry_run):
     zk = host_utils.MysqlZookeeper()
     for instance in zk.get_all_mysql_instances():
         if instance.hostname == hostname:
-            raise Exception("It appears {instance} is in zk. This is "
-                            "very dangerous!".format(instance=instance))
+            if skip_production_check:
+                log.warning("It appears {instance} is in zk but "
+                            "skip_production_check is set so continuing."
+                            "".format(instance=instance))
+            else:
+                raise Exception("It appears {instance} is in zk. This is "
+                                "very dangerous!".format(instance=instance))
     all_servers = environment_specific.get_all_server_metadata()
-    if not hostname in all_servers:
+    if hostname not in all_servers:
         raise Exception('Host {hostname} is not cmdb'.format(hostname=hostname))
 
     instance_metadata = all_servers[hostname]
@@ -115,16 +140,27 @@ def add_to_queue(hostname, dry_run):
     username, password = mysql_lib.get_mysql_user_for_role('admin')
 
     try:
-        log.info('Trying to reset user_statistics on ip '
-                 '{ip}'.format(ip=instance_metadata['internal_ip']))
-        with timeout.timeout(3):
-            conn = MySQLdb.connect(host=instance_metadata['internal_ip'],
-                                   user=username,
-                                   passwd=password,
-                                   cursorclass=MySQLdb.cursors.DictCursor)
-        if not conn:
-            raise Exception('timeout')
-        mysql_lib.enable_and_flush_activity_statistics(conn)
+        if check_for_user_activity(instance_metadata):
+            log.info('Trying to reset user_statistics on ip '
+                     '{ip}'.format(ip=instance_metadata['internal_ip']))
+            with timeout.timeout(3):
+                conn = MySQLdb.connect(host=instance_metadata['internal_ip'],
+                                       user=username,
+                                       passwd=password,
+                                       cursorclass=MySQLdb.cursors.DictCursor)
+            if not conn:
+                raise Exception('timeout')
+            if dry_run:
+                log.info('In dry_run mode, not changing anything')
+            else:
+                mysql_lib.enable_and_flush_activity_statistics(host_utils.HostAddr(hostname))
+        else:
+            log.info("No recent user activity, skipping stats reset")
+
+            # We still need to add it to the queue the first time.
+            # Check if it was added recently and exit if it was
+            if is_host_in_retirement_queue(hostname):
+                return
         activity = RESET_STATS
     except MySQLdb.OperationalError as detail:
         (error_code, msg) = detail.args
@@ -134,8 +170,15 @@ def add_to_queue(hostname, dry_run):
                  '{ip}'.format(ip=instance_metadata['internal_ip']))
         activity = SHUTDOWN_MYSQL
 
-    log_to_retirement_queue(hostname, instance_metadata['instance_id'],
-                            activity)
+        # We only want to add the host if it wasn't already in the queue
+        if is_host_in_retirement_queue(hostname):
+            return
+
+    if dry_run:
+        log.info('In dry_run mode, not changing anything')
+    else:
+        log_to_retirement_queue(hostname, instance_metadata['instance_id'],
+                                activity)
 
 
 def process_mysql_shutdown(hostname=None, dry_run=False):
@@ -162,36 +205,13 @@ def process_mysql_shutdown(hostname=None, dry_run=False):
         for active_instance in zk.get_all_mysql_instances():
             if active_instance.hostname == instance:
                 log.warning("It appears {instance} is in zk. This is "
-                            "very dangerous!".format(instance=instance))
-                remove_from_retirement_queue(instance)
+                            "very dangerous! If you got to here, you may be "
+                            "trying to turn down a replica set. Please remove "
+                            "it from zk and try again"
+                            "".format(instance=instance))
                 continue
-        log.info('Checking activity on {instance}'.format(instance=instance))
         # check mysql activity
-        with timeout.timeout(3):
-            conn = MySQLdb.connect(host=shutdown_instances[instance]['internal_ip'],
-                                   user=username,
-                                   passwd=password,
-                                   cursorclass=MySQLdb.cursors.DictCursor)
-        if not conn:
-            raise Exception('Could not connect to {ip}'
-                            ''.format(ip=shutdown_instances[instance]['internal_ip']))
-
-        activity = mysql_lib.get_user_activity(conn)
-        unexpected = set(activity.keys()).difference(IGNORABLE_USERS)
-        if unexpected:
-            log.error('Unexpected acitivty on {instance} by user(s):'
-                      '{unexpected}'.format(instance=instance,
-                                            unexpected=','.join(unexpected)))
-            continue
-
-        log.info('Checking current connections on '
-                 '{instance}'.format(instance=instance))
-        connected_users = mysql_lib.get_connected_users(conn)
-        unexpected = connected_users.difference(IGNORABLE_USERS)
-        if unexpected:
-            log.error('Unexpected connection on {instance} by user(s):'
-                      '{unexpected}'.format(instance=instance,
-                                            unexpected=','.join(unexpected)))
+        if check_for_user_activity(shutdown_instances[instance]):
             continue
 
         # joining on a blank string as password must not have a space between
@@ -302,6 +322,76 @@ def protect_host(hostname, reason):
     log.info(cursor._executed)
 
 
+def show_queue():
+    """ Show the servers in the queue and what state they are in.
+
+    Args:
+    None
+    """
+
+    recently_added = get_retirement_queue_servers(SHUTDOWN_MYSQL, True)
+    recently_shutdown = get_retirement_queue_servers(TERMINATE_INSTANCE, True)
+    ready_for_shutdown = get_retirement_queue_servers(SHUTDOWN_MYSQL)
+    ready_for_termination = get_retirement_queue_servers(TERMINATE_INSTANCE)
+
+    output = []
+    for server in recently_added.itervalues():
+        server['state'] = 'ADDED'
+        output.append(OUTPUT_FORMAT.format(**server))
+
+    for server in ready_for_shutdown.itervalues():
+        server['state'] = 'READY_FOR_MYSQL_SHUTDOWN'
+        output.append(OUTPUT_FORMAT.format(**server))
+
+    for server in recently_shutdown.itervalues():
+        server['state'] = 'MYSQL_SHUTDOWN'
+        output.append(OUTPUT_FORMAT.format(**server))
+
+    for server in ready_for_termination.itervalues():
+        server['state'] = 'READY_FOR_TERMINATION'
+        output.append(OUTPUT_FORMAT.format(**server))
+
+    output.sort()
+    log.info("The following servers are in the queue:\n%s", '\n'.join(output))
+
+    return
+
+
+def check_for_user_activity(instance):
+    zk = host_utils.MysqlZookeeper()
+    username, password = mysql_lib.get_mysql_user_for_role('admin')
+
+    # check mysql activity
+    log.info('Checking activity on {instance}'.format(instance=instance['hostname']))
+    with timeout.timeout(3):
+        conn = MySQLdb.connect(host=instance['internal_ip'],
+                               user=username,
+                               passwd=password,
+                               cursorclass=MySQLdb.cursors.DictCursor)
+    if not conn:
+        raise Exception('Could not connect to {ip}'
+                        ''.format(ip=instance['internal_ip']))
+
+    activity = mysql_lib.get_user_activity(host_utils.HostAddr(instance['hostname']))
+    unexpected = set(activity.keys()).difference(IGNORABLE_USERS)
+    if unexpected:
+        log.error('Unexpected activity on {instance} by user(s):'
+                  '{unexpected}'.format(instance=instance['hostname'],
+                                        unexpected=','.join(unexpected)))
+        return True
+
+    log.info('Checking current connections on '
+             '{instance}'.format(instance=instance['hostname']))
+    connected_users = mysql_lib.get_connected_users(host_utils.HostAddr(instance['hostname']))
+    unexpected = connected_users.difference(IGNORABLE_USERS)
+    if unexpected:
+        log.error('Unexpected connection on {instance} by user(s):'
+                  '{unexpected}'.format(instance=instance['hostname'],
+                                        unexpected=','.join(unexpected)))
+        return True
+    return False
+
+
 def get_protected_hosts(return_type='tuple'):
     """ Get data on all protected hosts
 
@@ -335,12 +425,16 @@ def get_protected_hosts(return_type='tuple'):
         return results_set
 
 
-def get_retirement_queue_servers(next_state):
+def get_retirement_queue_servers(next_state, recent=False):
     """ Pull instances in queue ready for termination
 
     Args:
     next_state - The desired next state of a server. Options are constants
                  SHUTDOWN_MYSQL and TERMINATE_INSTANCE.
+
+    recent     - When True, return hosts that have recently transitioned to a
+                 new state and are not currently eligible to have the next
+                 operation performed on them.
 
     Returns:
     A dict of the same form as what is returned from the cmdbs
@@ -355,15 +449,20 @@ def get_retirement_queue_servers(next_state):
         raise Exception('Invalid state param '
                         '"{next_state}"'.format(next_state=next_state))
 
+    if recent:
+        when = "    AND happened > now() - INTERVAL 1 DAY "
+    else:
+        when = ("    AND happened > now() - INTERVAL 3 WEEK "
+                "    AND happened < now() - INTERVAL 1 DAY ")
     reporting_conn = mysql_lib.get_mysqlops_connections()
     cursor = reporting_conn.cursor()
-    sql = ("SELECT t1.hostname, t1.instance_id "
+    sql = ("SELECT t1.hostname, t1.instance_id, t1.happened "
            "FROM ( "
-           "    SELECT hostname, instance_id "
+           "    SELECT hostname, instance_id, happened "
            "    FROM mysqlops.retirement_queue "
            "    WHERE activity = %(previous_state)s "
-           "    AND happened > now() - INTERVAL 3 WEEK "
-           "    AND happened < now() - INTERVAL 1 DAY) t1 "
+           + when +
+           "    ) t1 "
            "LEFT JOIN mysqlops.retirement_queue t2 on t1.instance_id = t2.instance_id "
            "AND t2.activity=%(next_state)s "
            "WHERE t2.hostname IS NULL;")
@@ -385,8 +484,19 @@ def get_retirement_queue_servers(next_state):
                       '{hostname}!'.format(hostname=instance['hostname']))
         else:
             ret[instance['hostname']] = all_servers[instance['hostname']]
+            ret[instance['hostname']]['happened'] = str(instance['happened'])
 
     return ret
+
+
+def is_host_in_retirement_queue(hostname):
+    sql = ("SELECT hostname "
+           "FROM mysqlops.retirement_queue "
+           "WHERE hostname = %(hostname)s")
+    reporting_conn = mysql_lib.get_mysqlops_connections()
+    cursor = reporting_conn.cursor()
+    cursor.execute(sql, {'hostname': hostname})
+    return cursor.rowcount > 0
 
 
 def log_to_retirement_queue(hostname, instance_id, activity):
@@ -433,4 +543,7 @@ def remove_from_retirement_queue(hostname):
 
 
 if __name__ == "__main__":
+    environment_specific.initialize_logger()
+    boto_logger = logging.getLogger('boto')
+    boto_logger.setLevel(logging.ERROR)
     main()

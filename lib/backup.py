@@ -1,5 +1,5 @@
 import boto
-from boto.utils import get_instance_metadata
+import datetime
 import os
 import re
 import resource
@@ -8,6 +8,7 @@ import sys
 import time
 import urllib
 
+import safe_uploader
 import mysql_lib
 import host_utils
 from lib import environment_specific
@@ -16,8 +17,9 @@ from lib import environment_specific
 BACKUP_FILE = 'mysql-{hostname}-{port}-{timestamp}.{backup_type}'
 BACKUP_LOCK_FILE = '/tmp/backup_mysql.lock'
 BACKUP_TYPE_LOGICAL = 'sql.gz'
+BACKUP_TYPE_CSV = 'csv'
 BACKUP_TYPE_XBSTREAM = 'xbstream'
-BACKUP_TYPES = set([BACKUP_TYPE_LOGICAL, BACKUP_TYPE_XBSTREAM])
+BACKUP_TYPES = set([BACKUP_TYPE_LOGICAL, BACKUP_TYPE_XBSTREAM, BACKUP_TYPE_CSV])
 INNOBACKUPEX = '/usr/bin/innobackupex'
 INNOBACKUP_OK = 'innobackupex: completed OK!'
 MYSQLDUMP = '/usr/bin/mysqldump'
@@ -31,13 +33,9 @@ MYSQLDUMP_CMD = ' '.join((MYSQLDUMP,
                           '--password={dump_pass}',
                           '--host={host}',
                           '--port={port}'))
-PIGZ = '/usr/bin/pigz -p 2'
+PIGZ = ['/usr/bin/pigz', '-p', '2']
 PV = '/usr/bin/pv -peafbt'
-SSH_OPTIONS = '-q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
-SSH_AUTH = '-i /home/dbutil/.ssh/id_rsa dbutil'
 S3_SCRIPT = '/usr/local/bin/gof3r'
-TEMP_DIR = '/backup/tmp/xtrabackup'
-TARGET_DIR = '/backup/mysql'
 USER_ROLE_MYSQLDUMP = 'mysqldump'
 USER_ROLE_XTRABACKUP = 'xtrabackup'
 XB_RESTORE_STATUS = ("CREATE TABLE IF NOT EXISTS test.xb_restore_status ("
@@ -58,8 +56,7 @@ XB_RESTORE_STATUS = ("CREATE TABLE IF NOT EXISTS test.xb_restore_status ("
                      "PRIMARY KEY(id), "
                      "INDEX (restore_type, started_at), "
                      "INDEX (restore_type, restore_status, started_at) )")
-XTRABACKUP_CMD = ' '.join(('/bin/bash -c "',
-                           INNOBACKUPEX,
+XTRABACKUP_CMD = ' '.join((INNOBACKUPEX,
                            '{datadir}',
                            '--slave-info',
                            '--safe-slave-backup',
@@ -73,9 +70,7 @@ XTRABACKUP_CMD = ' '.join(('/bin/bash -c "',
                            '--password={xtra_pass}',
                            '--defaults-file={cnf}',
                            '--defaults-group={cnf_group}',
-                           '--port={port}',
-                           '2>{tmp_log}',
-                           '>{tmp_xtra_path}"'))
+                           '--port={port}'))
 MINIMUM_VALID_BACKUP_SIZE_BYTES = 1024 * 1024
 
 log = environment_specific.setup_logging_defaults(__name__)
@@ -139,7 +134,7 @@ def parse_xtrabackup_binlog_info(datadir):
     return (binlog_file, binlog_pos)
 
 
-def get_host_from_backup(full_path):
+def get_metadata_from_backup_file(full_path):
     """ Parse the filename of a backup to determine the source of a backup
 
     Note: there is a strong assumption that the port number matches 330[0-9]
@@ -151,44 +146,16 @@ def get_host_from_backup(full_path):
 
     Returns:
     host - A hostaddr object
+    creation - a datetime object describing creation date
+    extension - file extension
     """
     filename = os.path.basename(full_path)
-    pattern = 'mysql-([a-z0-9-]+)-(330[0-9])-.+'
+    pattern = 'mysql-([a-z0-9-]+)-(330[0-9])-(\d{4})-(\d{2})-(\d{2}).*\.(.+)'
     res = re.match(pattern, filename)
-    return host_utils.HostAddr(''.join((res.group(1),
-                                        ':',
-                                        res.group(2))))
-
-
-def remove_backups(backup_path,
-                   extension,
-                   keep_newest=1):
-    """ Remove old database backup files
-
-    Args:
-    backup_path - A string which is the path to the backup directory.
-    extension - A tuple of extensions of files to be acted on. Note
-                '.log' files of the same name of files being purged
-                will also be removed.
-    keep_newest - How many backups should be kept.
-    """
-    # Get list of backup files in the path specified
-    files = list()
-    for entry in os.listdir(backup_path):
-        if entry.endswith(extension):
-            fullpath = os.path.join(backup_path, entry)
-            files.append((os.stat(fullpath).st_mtime, fullpath))
-    files.sort()
-
-    to_delete = max(0, len(files) - keep_newest)
-    for entry in files[:to_delete]:
-        log.info('Deleting backup file: {}'.format(entry[1]))
-        os.remove(entry[1])
-
-        log_file = ''.join((entry[1], '.log'))
-        if os.path.isfile(log_file):
-            log.info('Deleting log file: {log}'.format(log=log_file))
-            os.remove(log_file)
+    host = host_utils.HostAddr(':'.join((res.group(1), res.group(2))))
+    creation = datetime.date(int(res.group(3)), int(res.group(4)), int(res.group(5)))
+    extension = res.group(6)
+    return host, creation, extension
 
 
 def logical_backup_instance(instance, timestamp):
@@ -201,44 +168,34 @@ def logical_backup_instance(instance, timestamp):
     Returns:
     A string of the path to the finished backup
     """
-    (temp_path, target_path) = get_paths(port=instance.port)
     dump_file = BACKUP_FILE.format(hostname=instance.hostname,
                                    port=instance.port,
                                    timestamp=time.strftime('%Y-%m-%d-%H:%M:%S',
                                                            timestamp),
                                    backup_type=BACKUP_TYPE_LOGICAL)
-    dump_tmp_path = os.path.join(temp_path, dump_file)
-    dump_path = os.path.join(target_path, dump_file)
     dump_user, dump_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_MYSQLDUMP)
     dump_cmd = MYSQLDUMP_CMD.format(dump_user=dump_user,
                                     dump_pass=dump_pass,
                                     host=instance.hostname,
                                     port=instance.port)
-
-    with open(dump_tmp_path, "w") as out:
-        log.info('Running dump')
-        log.info('{dump_cmd} | {pigz} > {dump_tmp_path}'
-                 ''.format(dump_cmd=dump_cmd,
-                           pigz=PIGZ,
-                           dump_tmp_path=dump_tmp_path))
-        dump = subprocess.Popen(dump_cmd,
-                                shell=True,
-                                stdout=subprocess.PIPE,
-                                stderr=sys.stderr)
-        pigz = subprocess.Popen(PIGZ,
-                                shell=True,
-                                stdin=dump.stdout,
-                                stdout=out,
-                                stderr=sys.stderr)
-        dump.wait()
-        pigz.wait()
-        if dump.returncode != 0:
-            raise Exception("Error: mysqldump did not succeed, aborting")
-
-    log.info('Moving backup and to {target}'.format(target=target_path))
-    os.rename(dump_tmp_path, dump_path)
-    log.info('mysqldump was successful')
-    return dump_path
+    procs = dict()
+    try:
+        procs['mysqldump'] = subprocess.Popen(dump_cmd.split(),
+                                              stdout=subprocess.PIPE)
+        procs['pigz'] = subprocess.Popen(PIGZ,
+                                         stdin=procs['mysqldump'].stdout,
+                                         stdout=subprocess.PIPE)
+        log.info('Uploading backup to {buk}/{key}'
+                 ''.format(buk=environment_specific.S3_BUCKET,
+                           key=dump_file))
+        safe_uploader.safe_upload(precursor_procs=procs,
+                                  stdin=procs['pigz'].stdout,
+                                  bucket=environment_specific.S3_BUCKET,
+                                  key=dump_file)
+        log.info('mysqldump was successful')
+    except:
+        safe_uploader.kill_precursor_procs(procs)
+        raise
 
 
 def xtrabackup_instance(instance, timestamp):
@@ -253,17 +210,61 @@ def xtrabackup_instance(instance, timestamp):
     """
     # Prevent issues with too many open files
     resource.setrlimit(resource.RLIMIT_NOFILE, (131072, 131072))
-    (temp_path, target_path) = get_paths(port=str(instance.port))
     backup_file = BACKUP_FILE.format(hostname=instance.hostname,
                                      port=instance.port,
-                                     timestamp=time.strftime('%Y-%m-%d-%H:%M:%S',
-                                                             timestamp),
+                                     timestamp=time.strftime('%Y-%m-%d-%H:%M:%S', timestamp),
                                      backup_type=BACKUP_TYPE_XBSTREAM)
-    tmp_xtra_path = os.path.join(temp_path, backup_file)
-    target_xtra_path = os.path.join(target_path, backup_file)
-    tmp_log = ''.join((tmp_xtra_path, '.log'))
-    target_log = ''.join((tmp_xtra_path, '.log'))
 
+    tmp_log = os.path.join(environment_specific.RAID_MOUNT,
+                           'log',
+                           ''.join(['xtrabackup_',
+                                    time.strftime('%Y-%m-%d-%H:%M:%S', timestamp),
+                                    '.log']))
+    tmp_log_handle = open(tmp_log, "w")
+    procs = dict()
+    try:
+        procs['xtrabackup'] = subprocess.Popen(create_xtrabackup_command(instance, timestamp, tmp_log),
+                                               stdout=subprocess.PIPE,
+                                               stderr=tmp_log_handle)
+        log.info('Uploading backup to {buk}/{loc}'
+                 ''.format(buk=environment_specific.S3_BUCKET,
+                           loc=backup_file))
+        safe_uploader.safe_upload(precursor_procs=procs,
+                                  stdin=procs['xtrabackup'].stdout,
+                                  bucket=environment_specific.S3_BUCKET,
+                                  key=backup_file,
+                                  check_func=check_xtrabackup_log,
+                                  check_arg=tmp_log)
+        log.info('Xtrabackup was successful')
+    except:
+        safe_uploader.kill_precursor_procs(procs)
+        raise
+
+
+def check_xtrabackup_log(tmp_log):
+    """ Confirm that a xtrabackup backup did not have problems
+
+    Args:
+    tmp_log - The path of the log file
+    """
+    with open(tmp_log, 'r') as log_file:
+        xtra_log = log_file.readlines()
+        if INNOBACKUP_OK not in xtra_log[-1]:
+            raise Exception('innobackupex failed. '
+                            'log_file: {tmp_log}'.format(tmp_log=tmp_log))
+
+
+def create_xtrabackup_command(instance, timestamp, tmp_log):
+    """ Create a xtrabackup command
+
+    Args:
+    instance - A hostAddr object
+    timestamp - A timestamp
+    tmp_log - A path to where xtrabackup should log
+
+    Returns:
+    a list that can be easily ingested by subprocess
+    """
     if host_utils.get_hiera_role() in host_utils.MASTERFUL_PUPPET_ROLES:
         cnf = host_utils.OLD_CONF_ROOT.format(port=instance.port)
         cnf_group = 'mysqld'
@@ -272,31 +273,16 @@ def xtrabackup_instance(instance, timestamp):
         cnf_group = 'mysqld{port}'.format(port=instance.port)
     datadir = host_utils.get_cnf_setting('datadir', instance.port)
     xtra_user, xtra_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_XTRABACKUP)
-    cmd = XTRABACKUP_CMD.format(datadir=datadir,
-                                xtra_user=xtra_user,
-                                xtra_pass=xtra_pass,
-                                cnf=cnf,
-                                cnf_group=cnf_group,
-                                port=instance.port,
-                                tmp_log=tmp_log,
-                                tmp_xtra_path=tmp_xtra_path)
-    log.info(cmd)
-    xtra = subprocess.Popen(cmd, shell=True)
-    xtra.wait()
-    with open(tmp_log, 'r') as log_file:
-        xtra_log = log_file.readlines()
-        if INNOBACKUP_OK not in xtra_log[-1]:
-            raise Exception('innobackupex failed. '
-                            'log_file: {tmp_log}'.format(tmp_log=tmp_log))
-
-    log.info('Moving backup and log to {target}'.format(target=target_path))
-    os.rename(tmp_xtra_path, target_xtra_path)
-    os.rename(tmp_log, target_log)
-    log.info('Xtrabackup was successful')
-    return target_xtra_path
+    return XTRABACKUP_CMD.format(datadir=datadir,
+                                 xtra_user=xtra_user,
+                                 xtra_pass=xtra_pass,
+                                 cnf=cnf,
+                                 cnf_group=cnf_group,
+                                 port=instance.port,
+                                 tmp_log=tmp_log).split()
 
 
-def xbstream_unpack(xbstream, port, restore_source, restore_type, size=None):
+def xbstream_unpack(xbstream, port, restore_source, size=None):
     """ Decompress an xbstream filename into a directory.
 
     Args:
@@ -305,31 +291,13 @@ def xbstream_unpack(xbstream, port, restore_source, restore_type, size=None):
     host - A string which is a hostname if the xbstream exists on a remote host
     size - An int for the size in bytes for remote unpacks for a progress bar
     """
-    (temp_path, target_path) = get_paths(port)
-    temp_backup = os.path.join(temp_path, os.path.basename(xbstream))
     datadir = host_utils.get_cnf_setting('datadir', port)
 
-    if restore_type == 's3':
-        cmd = ('{s3_script} get --no-md5 -b {bucket} -k {xbstream} '
-               '2>/dev/null ').format(s3_script=S3_SCRIPT,
-                                      bucket=environment_specific.S3_BUCKET,
-                                      xbstream=urllib.quote_plus(xbstream),
-                                      temp_backup=temp_backup)
-
-    elif restore_type == 'local_file':
-        cmd = '{pv} {xbstream}'.format(pv=PV,
-                                       xbstream=xbstream)
-    elif restore_type == 'remote_server':
-        cmd = ("ssh {ops} {auth}@{host} '/bin/cat {xbstream}' "
-               "").format(ops=SSH_OPTIONS,
-                          auth=SSH_AUTH,
-                          host=restore_source.hostname,
-                          xbstream=xbstream,
-                          temp_backup=temp_backup)
-    else:
-        raise Exception('Restore type {restore_type} is not supported'.format(restore_type=restore_type))
-
-    if size and restore_type != 'localhost':
+    cmd = ('{s3_script} get --no-md5 -b {bucket} -k {xbstream} '
+           '2>/dev/null ').format(s3_script=S3_SCRIPT,
+                                  bucket=environment_specific.S3_BUCKET,
+                                  xbstream=urllib.quote_plus(xbstream))
+    if size:
         cmd = ' | '.join((cmd, '{pv} -s {size}'.format(pv=PV,
                                                        size=str(size))))
     # And finally pipe everything into xbstream to unpack it
@@ -412,82 +380,6 @@ def apply_log(port, memory='10G'):
             raise Exception(msg)
 
 
-def get_remote_backup(hostaddr, date=None):
-    """ Find the most recent xbstream file on the desired instance
-
-    Args:
-    hostaddr - A hostaddr object for the desired instance
-    date - desire date of restore file
-
-    Returns:
-    filename - The path to the most recent xbstream file
-    size - The size of the backup file
-    """
-    path = os.path.join(TARGET_DIR, str(hostaddr.port))
-    if date:
-        date_param = '{date}*'.format(date=date)
-    else:
-        date_param = ''
-    cmd = ("ssh {ops} {auth}@{host} 'ls -tl {path}/*{date_param}.xbstream |"
-           " head -n1'").format(ops=SSH_OPTIONS,
-                                auth=SSH_AUTH,
-                                host=hostaddr.hostname,
-                                path=path,
-                                date_param=date_param)
-    log.info(cmd)
-
-    # We really only care here if there is output. Basically we will
-    # ignore return code and stderr if we get stdout
-    (out, err, _) = host_utils.shell_exec(cmd)
-
-    if not out:
-        msg = 'No backup found for {host} in {path}.\nError: {err}'
-        raise Exception(msg.format(host=hostaddr.hostname,
-                                   path=path,
-                                   err=err))
-
-    entries = out.split()
-    size = entries[4]
-    filename = entries[8]
-
-    # Probably unlikely that we'd have a remote-server backup that's too small,
-    # but we check anyway.
-    if size < MINIMUM_VALID_BACKUP_SIZE_BYTES:
-        msg = ('Found backup {backup_file} for host {host} '
-               'but it is too small... '
-               '({size} bytes < {min_size} bytes) '
-               'Ignoring it.').format(backup_file=filename,
-                                      host=hostaddr.hostname,
-                                      size=size,
-                                      min_size=MINIMUM_VALID_BACKUP_SIZE_BYTES)
-        raise Exception(msg)
-
-    msg = ('Found a backup {filename} with a '
-           'size of {size}').format(size=size,
-                                    filename=filename)
-    log.debug(msg)
-    return filename, size
-
-
-def s3_upload(backup_file):
-    """ Upload a backup file to s3.
-
-    Args:
-    backup_file - The file to be uploaded
-    """
-    cmd = ("{pv} {backup_file} | "
-           "{S3_SCRIPT} put --key={s3_file} --bucket={S3_BUCKET} 2>/dev/null"
-           "".format(pv=PV,
-                     S3_BUCKET=environment_specific.S3_BUCKET,
-                     S3_SCRIPT=S3_SCRIPT,
-                     s3_file=urllib.quote_plus(os.path.basename(backup_file)),
-                     backup_file=backup_file))
-    log.info(cmd)
-    upload = subprocess.Popen(cmd, shell=True)
-    if upload.wait() != 0:
-        raise Exception("Error: Upload to s3 failed.")
-
-
 def get_s3_backup(hostaddr, date=None, backup_type=BACKUP_TYPE_XBSTREAM):
     """ Find the most recent xbstream file for an instance on s3
 
@@ -503,22 +395,9 @@ def get_s3_backup(hostaddr, date=None, backup_type=BACKUP_TYPE_XBSTREAM):
     if date:
         prefix = ''.join((prefix, '-', date))
     log.debug('looking for backup with prefix {prefix}'.format(prefix=prefix))
-
-    # by default, we try to do this the "old" way.  if we return 403,
-    # we'll retry the "new" way.
-    try:
-        conn = boto.connect_s3()
-        bucket = conn.get_bucket(environment_specific.S3_BUCKET, validate=False)
-        bucket_items = bucket.get_all_keys(prefix=prefix)
-    except:
-        ROLE = 'base'
-        md = get_instance_metadata()
-        creds = md['iam']['security-credentials'][ROLE]
-        conn = boto.connect_s3(aws_access_key_id=creds['AccessKeyId'],
-                               aws_secret_access_key=creds['SecretAccessKey'],
-                               security_token=creds['Token'])
-        bucket = conn.get_bucket(environment_specific.S3_BUCKET, validate=False)
-        bucket_items = bucket.get_all_keys(prefix=prefix)
+    conn = boto.connect_s3()
+    bucket = conn.get_bucket(environment_specific.S3_BUCKET, validate=False)
+    bucket_items = bucket.list(prefix=prefix)
 
     latest_backup = None
     for elem in bucket_items:
@@ -571,12 +450,12 @@ def start_restore_log(instance, params):
                     "continue with restore anyway.".format(e=e))
         return None
 
-    if not mysql_lib.does_table_exist(conn, 'test', 'xb_restore_status'):
+    if not mysql_lib.does_table_exist(instance, 'test', 'xb_restore_status'):
         create_status_table(conn)
     sql = ("REPLACE INTO test.xb_restore_status "
            "SET "
            "restore_source = %(restore_source)s, "
-           "restore_type = %(restore_type)s, "
+           "restore_type = 's3', "
            "restore_file = %(restore_file)s, "
            "restore_destination = %(source_instance)s, "
            "restore_date = %(restore_date)s, "
@@ -635,6 +514,20 @@ def update_restore_log(instance, row_id, params):
     conn.close()
 
 
+def get_most_recent_restore(instance):
+    conn = mysql_lib.connect_mysql(instance)
+    cursor = conn.cursor()
+    sql = ("SELECT * "
+           "FROM test.xb_restore_status "
+           "WHERE restore_status='OK' ")
+    try:
+        cursor.execute(sql)
+    except Exception as e:
+        print ("UNKNOWN: Cannot query restore status table: {e}".format(e=e))
+        sys.exit(3)
+    return cursor.fetchall()
+
+
 def create_status_table(conn):
     """ Create the restoration status table if it isn't already there.
 
@@ -655,37 +548,5 @@ def create_status_table(conn):
 
 
 def quick_test_replication(instance):
-    conn = mysql_lib.connect_mysql(instance)
-    cursor = conn.cursor()
-    cursor.execute('START SLAVE')
-    time.sleep(2)
-    ss = mysql_lib.get_slave_status(conn)
-    if ss['Slave_IO_Running'] == 'No':
-        raise Exception('Replication [IO THREAD] failed '
-                        'to start: {e}'.format(e=ss['Last_IO_Error']))
-    if ss['Slave_SQL_Running'] == 'No':
-        raise Exception('Replication [SQL THREAD] failed '
-                        'to start: {e}'.format(e=ss['Last_SQL_Error']))
-
-
-def get_paths(port):
-    """ Fetch the scratch and final directory for backups
-
-    Args:
-    port - An int which corresponds to the port on which the MySQL instance
-           listens
-
-    Returns:
-    temp_path -  A string which is a path for scratch files. This path is
-                 aggressively purged
-    target_path - A string which is a path store sane backups. This path is
-                  purged selectively to keep some number of backups.
-    """
-    temp_path = os.path.join(TEMP_DIR, str(port))
-    target_path = os.path.join(TARGET_DIR, str(port))
-    for path in [temp_path, target_path]:
-        if not os.path.exists(path):
-            log.info("{path} does not exist, creating".format(path=path))
-            os.makedirs(path)
-
-    return temp_path, target_path
+    mysql_lib.start_replication(instance)
+    mysql_lib.assert_replication_sanity(instance)

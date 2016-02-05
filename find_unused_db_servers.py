@@ -32,7 +32,7 @@ def get_db_host_prefix(hostname):
     Argument:
     hostname - a hostname
 
-    Retunrs:
+    Returns:
     a prefix of the hostname
     """
     prefix_match = re.match('(.+db)', hostname)

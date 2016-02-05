@@ -68,9 +68,8 @@ def find_shard_mismatches(instance=False):
     for master in host_shard_map:
         expected_shards = host_shard_map[master]
         instance = host_utils.HostAddr(master)
-        conn = mysql_lib.connect_mysql(instance)
-        activity = mysql_lib.get_dbs_activity(conn)
-        actual_shards = mysql_lib.get_dbs(conn)
+        activity = mysql_lib.get_dbs_activity(instance)
+        actual_shards = mysql_lib.get_dbs(instance)
         unexpected_shards = actual_shards.difference(expected_shards)
         missing = expected_shards.difference(actual_shards)
         if missing:

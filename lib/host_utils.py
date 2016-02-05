@@ -22,8 +22,6 @@ DEFAULT_HIERA_ROLE = 'mlpv2'
 DEFAULT_PINFO_CLOUD = 'undefined'
 MASTERFUL_PUPPET_ROLES = ['singleshard', 'modshard']
 HOSTNAME = socket.getfqdn().split('.')[0]
-MODSHARDDB_PREFACE = 'pbmoddata'
-MODSHARDDB_ZPAD = 3
 MYSQL_CNF_FILE = '/etc/mysql/my.cnf'
 MYSQL_INIT_FILE = '/etc/mysql/init.sql'
 MYSQL_UPGRADE_CNF_FILE = '/etc/mysql/mysql_upgrade.cnf'
@@ -46,9 +44,7 @@ TESTING_DATA_DIR = '/tmp/'
 TESTING_PINFO_CLOUD = 'vagrant'
 
 # /raid0 and /mnt are interchangable; use whichever one we have.
-REQUIRED_MOUNTS = ['/raid0:/mnt', '/backup']
-SHARDDB_PREFACE = 'pbdata'
-SHARDDB_ZPAD = 5
+REQUIRED_MOUNTS = ['/raid0:/mnt']
 SUPERVISOR_CMD = '/usr/local/bin/supervisorctl {action} mysql:mysqld-{port}'
 INIT_CMD = '/etc/init.d/mysqld_multi {options} {action} {port}'
 PTKILL_CMD = '/usr/sbin/service pt-kill-{port} {action}'
@@ -499,19 +495,19 @@ class MysqlZookeeper:
     def get_host_shard_map(self, repl_type=REPLICA_ROLE_MASTER):
         """ Get a mapping of what shards exist on MySQL master servers
 
+        Args:
+        repl_type: optionally specify a replica type
+
         Returns:
         A dict with a key of the MySQL master instance and the value a set
         of shards
         """
         shard_map = dict()
-        sharddb_map = self.compute_shard_map(environment_specific.SHARD_MAPPING,
-                                             SHARDDB_PREFACE,
-                                             SHARDDB_ZPAD)
-        modsharddb_map = self.compute_shard_map(environment_specific.MOD_SHARD_MAPPING,
-                                                MODSHARDDB_PREFACE,
-                                                MODSHARDDB_ZPAD)
-        shard_map.update(sharddb_map)
-        shard_map.update(modsharddb_map)
+        for sharded_db in environment_specific.SHARDED_DBS_PREFIX_MAP.values():
+            sharddb_map = self.compute_shard_map(sharded_db['mappings'],
+                                                 sharded_db['prefix'],
+                                                 sharded_db['zpad'])
+            shard_map.update(sharddb_map)
 
         host_shard_map = dict()
         for replica_set in shard_map:
@@ -521,7 +517,7 @@ class MysqlZookeeper:
 
         return host_shard_map
 
-    def compute_shard_map(self, mapping, preface, zpad):
+    def compute_shard_map(self, mapping, prefix, zpad):
         """ Get mapping of shards to replica_sets
 
         Args:
@@ -541,7 +537,7 @@ class MysqlZookeeper:
         for replica_set in mapping:
             for shard_num in range(replica_set['range'][0],
                                    replica_set['range'][1] + 1):
-                shard_name = ''.join((preface, str(shard_num).zfill(zpad)))
+                shard_name = ''.join((prefix, str(shard_num).zfill(zpad)))
                 # Note: host in this context means replica set name
                 if replica_set['host'] not in shard_mapping:
                     shard_mapping[replica_set['host']] = set()
@@ -566,6 +562,24 @@ class MysqlZookeeper:
                 return HostAddr(instance)
 
         raise Exception('Could not determine shard replica set for shard {shard}'.format(shard=shard))
+
+    def get_shards_by_shard_type(self, shard_type):
+        """ Get a set of all shards in a shard type
+
+        Args:
+        shard_type - The type of shards, i.e. 'sharddb'
+
+        Returns:
+        A set of all shard names
+        """
+        sharding_info = environment_specific.SHARDED_DBS_PREFIX_MAP[shard_type]
+        shards = set()
+        for replica_set in sharding_info['mappings']:
+            for shard_num in range(replica_set['range'][0],
+                                   replica_set['range'][1] + 1):
+                shards.add(''.join((sharding_info['prefix'],
+                                    str(shard_num).zfill(sharding_info['zpad']))))
+        return shards
 
 
 class HostAddr:
@@ -734,7 +748,7 @@ def change_owner(directory, user, group):
     cmd = '/bin/chown -R {user}:{group} {path}'.format(user=user,
                                                        group=group,
                                                        path=path)
-    log.info(cmd)
+    log.debug(cmd)
     (out, err, ret) = shell_exec(cmd)
     if ret != 0:
         print err
@@ -751,7 +765,7 @@ def change_perms(directory, numeric_perms):
     path = os.path.realpath(directory)
     cmd = '/bin/chmod -R {perms} {path}'.format(perms=str(numeric_perms),
                                                 path=path)
-    log.info(cmd)
+    log.debug(cmd)
     (out, err, ret) = shell_exec(cmd)
     if ret != 0:
         print err

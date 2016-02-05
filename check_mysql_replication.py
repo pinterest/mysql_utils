@@ -10,7 +10,6 @@ def main():
     parser.add_argument('replica',
                         help='Replica MySQL instance to sanity check '
                         'hostname[:port]')
-
     parser.add_argument('-w',
                         '--watch_for_catch_up',
                         help='Watch replication for catch up ',

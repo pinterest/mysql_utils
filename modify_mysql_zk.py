@@ -128,46 +128,6 @@ def determine_replacement_role(conn, instance_id):
         return repl_type
 
 
-def sanity_check_replica(instance):
-    """ Make sure a slave is slaving and relatively caught up
-
-    Args:
-    instance - A hostaddr object
-
-    Returns:
-    A hostaddr object of master of the instance argument
-    """
-    # Test to see if the slave is setup for replication. If not, we are hosed
-    conn = mysql_lib.connect_mysql(instance)
-    try:
-        mysql_lib.get_master_status(conn)
-    except mysql_lib.ReplicationError:
-        raise Exception('{instance} is not setup to write replicaiton '
-                        'logs!'.format(instance=instance))
-
-    replication = mysql_lib.calc_slave_lag(instance)
-    if replication['ss']['Slave_SQL_Running'] != 'Yes':
-        raise Exception('SQL thread is not running on {instance}'
-                        ''.format(instance=instance))
-
-    if replication['ss']['Slave_IO_Running'] != 'Yes':
-        raise Exception('IO thread is not running on {instance}'
-                        ''.format(instance=instance))
-
-    if replication['sbm'] > mysql_lib.MAX_HEARTBEAT_LAG:
-        raise Exception('Heartbeat lag {sbm} > {max_lag} seconds'
-                        ''.format(sbm=replication['sbm'],
-                                  max_lag=mysql_lib.MAX_HEARTBEAT_LAG))
-
-    if replication['io_bytes'] > mysql_lib.MAX_IO_LAG:
-        raise Exception('IO lag {io_bytes} > {max_io} bytes'
-                        ''.format(io_bytes=replication['io_bytes'],
-                                  max_io=mysql_lib.MAX_IO_LAG))
-    master = host_utils.HostAddr(':'.join((replication['ss']['Master_Host'],
-                                           str(replication['ss']['Master_Port']))))
-    return master
-
-
 def get_zk_node_for_replica_set(kazoo_client, replica_set):
     """ Figure out what node holds the configuration of a replica set
 
@@ -228,13 +188,16 @@ def add_replica_to_zk(instance, replica_type, dry_run):
             raise Exception('Could not get a zk connection')
 
         log.info('Instance is {inst}'.format(inst=instance))
-        master = sanity_check_replica(instance)
+        mysql_lib.assert_replication_sanity(instance)
+        mysql_lib.assert_replication_unlagged(instance, mysql_lib.REPLICATION_TOLERANCE_NORMAL)
+        master = mysql_lib.get_master_from_instance(instance)
+        if master not in zk_local.get_all_mysql_instances_by_type(host_utils.REPLICA_ROLE_MASTER):
+            raise Exception('Instance {master} is not a master in zk'
+                            ''.format(master=master))
+
         log.info('Detected master of {instance} '
                  'as {master}'.format(instance=instance,
                                       master=master))
-
-        if master not in zk_local.get_all_mysql_instances_by_type(host_utils.REPLICA_ROLE_MASTER):
-            raise Exception('Instance master is not a master in zk')
 
         (replica_set, _) = zk_local.get_replica_set_from_instance(master)
         log.info('Detected replica_set as '

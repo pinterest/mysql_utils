@@ -104,8 +104,7 @@ def mysql_init_server(instance,
         mysql_grants.manage_mysql_grants(instance, 'nuke_then_import')
 
         log.info('Creating test database')
-        conn = mysql_lib.connect_mysql(instance)
-        mysql_lib.create_db(conn, 'test')
+        mysql_lib.create_db(instance, 'test')
 
         log.info('Setting up query response time plugins')
         mysql_lib.setup_response_time_metrics(instance)

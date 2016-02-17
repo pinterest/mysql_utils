@@ -67,9 +67,9 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None))
     # If we ever want to run multi instance, this wil need to be updated
-    backup = mysql_backup_csv(host_utils.HostAddr(host_utils.HOSTNAME),
+    backup_obj = mysql_backup_csv(host_utils.HostAddr(host_utils.HOSTNAME),
                               args.db, args.force_table, args.force_reupload)
-    backup.backup_instance()
+    backup_obj.backup_instance()
 
 
 class mysql_backup_csv:
@@ -124,7 +124,7 @@ class mysql_backup_csv:
             mysql_lib.stop_replication(self.instance, mysql_lib.REPLICATION_THREAD_SQL)
 
             workers = []
-            for _ in range(multiprocessing.cpu_count()/2):
+            for _ in range(multiprocessing.cpu_count() / 2):
                 proc = multiprocessing.Process(target=self.mysql_backup_csv_dbs)
                 proc.daemon = True
                 proc.start()
@@ -277,13 +277,8 @@ class mysql_backup_csv:
             if os.path.exists(fifo):
                 self.cleanup_fifo(fifo)
 
-            for proc in procs:
-                if procs[proc] and psutil.pid_exists(procs[proc].pid):
-                    try:
-                        procs[proc].kill()
-                    except:
-                        # process no longer exists, no big deal.
-                        pass
+            safe_uploader.kill_precursor_procs(procs)
+
             raise
 
     def create_fifo(self, fifo):
@@ -369,37 +364,6 @@ class mysql_backup_csv:
         if SUCCESS_ENTRY not in return_value:
             raise Exception('{proc_id}: dump failed'
                             ''.format(proc_id=multiprocessing.current_process().name))
-
-    def check_procs(self, procs, term_path=None):
-        """ Make sure that subprocess don't die
-
-        Args:
-        procs - An array of processes
-        term_path - Path to touch to kill repater.
-
-        Returns:
-        True if all process have finished successfully,
-        False if some are still running.
-        """
-        success = True
-        # explicitly order the for loop
-        for proc in ['cat', 'nullescape', 'lzop', 'repeater', 'upload']:
-            if (proc == 'repeater' and term_path and
-                    success and not os.path.exists(term_path)):
-                log.debug('{proc_id}: creating term file {term_path}'
-                          ''.format(proc_id=multiprocessing.current_process().name,
-                                    term_path=term_path))
-                open(term_path, 'w').close()
-
-            ret = procs[proc].poll()
-            if ret is None:
-                success = False
-            elif ret != 0:
-                raise Exception('{proc_id}: {proc} encountered an error'
-                                ''.format(proc_id=multiprocessing.current_process().name,
-                                          proc=proc))
-
-        return success
 
     def upload_pitr_data(self, db, pitr_data):
         """ Upload a file of PITR data to s3 for each schema

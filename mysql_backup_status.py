@@ -200,6 +200,18 @@ def verify_unsharded_csv_backup(shard_type, date, instance):
                                                             db_name=db)
             if not bucket.get_key(key):
                 missing_uploads.add(key)
+            else:
+                # we still need to create a success file for the data
+                # team for this table, even if something else is AWOL
+                # later in the backup.
+                key_name = mysql_backup_csv.PATH_DAILY_SUCCESS.format(
+                        table=table, hostname_prefix=shard_type, date=date)
+                if bucket.get_key(key_name):
+                    print 'Key already exists {key}'.format(key=key_name)
+                else:
+                    print 'Creating success key {key}'.format(key=key_name)
+                    key = bucket.new_key(key_name)
+                    key.set_contents_from_string('')
 
     if missing_uploads:
         if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:

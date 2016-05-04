@@ -55,7 +55,7 @@ def main():
 
 def mysql_failover(master, dry_run, skip_lock,
                    ignore_dr_slave, trust_me_its_dead, kill_old_master):
-    """ Promte a new MySQL master
+    """ Promote a new MySQL master
 
     Args:
     master - Hostaddr object of the master instance to be demoted

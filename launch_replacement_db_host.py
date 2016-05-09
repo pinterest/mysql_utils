@@ -10,9 +10,7 @@ from lib import environment_specific
 from lib import host_utils
 from lib import mysql_lib
 
-SUPPORTED_MYSQL_MAJOR_VERSIONS = {'5.5': '55', '5.6': '56'}
 DEFAULT_MYSQL_MAJOR_VERSION = '5.6'
-SUPPORTED_MYSQL_MINOR_VERSIONS = set(('stable', 'staging', 'latest'))
 DEFAULT_MYSQL_MINOR_VERSION = 'stable'
 # After SERVER_BUILD_TIMEOUT we can assume that the build failed
 # and automatically go into --replace_again mode
@@ -71,12 +69,12 @@ def main():
                         help=('Do not replace with an instance of the same '
                               'version as the master db, instead use the '
                               'supplied version.'),
-                        choices=SUPPORTED_MYSQL_MAJOR_VERSIONS.keys(),
+                        choices=environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS,
                         default=None)
     parser.add_argument('--override_mysql_minor_version',
                         help=('Which "branch" of the MySQL major version'
                               'to be used. Default is "stable".'),
-                        choices=SUPPORTED_MYSQL_MINOR_VERSIONS,
+                        choices=environment_specific.SUPPORTED_MYSQL_MINOR_VERSIONS,
                         # default is set in the underlying function
                         default=None)
     parser.add_argument('--override_classic_security',
@@ -219,11 +217,11 @@ def launch_replacement_db_host(original_server,
                          ''.format(key=key,
                                    old=replacement_config[key],
                                    new=overrides[key]))
-                replacement_config[key] = overrides[key]
                 reasons.add('changing {key} from {old} to '
-                            '{old}'.format(key=key,
+                            '{new}'.format(key=key,
                                            old=replacement_config[key],
                                            new=overrides[key]))
+                replacement_config[key] = overrides[key]
                 config_overridden = True
 
     if config_overridden:
@@ -255,7 +253,7 @@ def launch_replacement_db_host(original_server,
     # If we get to here and there is no reason, bail out
     if not reasons and not replacement_config['dry_run']:
         raise Exception(('MySQL appears to be up and no reason for '
-                         'replacement is supplied. You can specify a reason'
+                         'replacement is supplied. You can specify a reason '
                          'with the --reason argument'))
     reason = ', '.join(reasons)
     log.info('Reason for launch: {reason}'.format(reason=reason))

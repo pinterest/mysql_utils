@@ -502,18 +502,22 @@ class MysqlZookeeper:
         A dict with a key of the MySQL master instance and the value a set
         of shards
         """
-        shard_map = dict()
+        global_shard_map = dict()
         for sharded_db in environment_specific.SHARDED_DBS_PREFIX_MAP.values():
-            sharddb_map = self.compute_shard_map(sharded_db['mappings'],
-                                                 sharded_db['prefix'],
-                                                 sharded_db['zpad'])
-            shard_map.update(sharddb_map)
+            shard_map = self.compute_shard_map(sharded_db['mappings'],
+                                               sharded_db['prefix'],
+                                               sharded_db['zpad'])
+            for entry in shard_map:
+                if entry in global_shard_map:
+                    global_shard_map[entry].update(shard_map[entry])
+                else:
+                    global_shard_map[entry] = shard_map[entry]
 
         host_shard_map = dict()
-        for replica_set in shard_map:
+        for replica_set in global_shard_map:
             instance = self.get_mysql_instance_from_replica_set(replica_set,
                                                                 repl_type)
-            host_shard_map[instance.__str__()] = shard_map[replica_set]
+            host_shard_map[instance.__str__()] = global_shard_map[replica_set]
 
         return host_shard_map
 
@@ -556,7 +560,6 @@ class MysqlZookeeper:
         A hostaddr object for an instance of the replica set
         """
         shard_map = self.get_host_shard_map(repl_type)
-
         for instance in shard_map:
             if shard in shard_map[instance]:
                 return HostAddr(instance)

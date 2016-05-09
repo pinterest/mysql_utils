@@ -16,6 +16,7 @@ import _mysql_exceptions
 import psutil
 
 import safe_uploader
+import mysql_backup_status
 from lib import backup
 from lib import environment_specific
 from lib import host_utils
@@ -38,11 +39,8 @@ CSV_BACKUP_LOCK_TABLE = """CREATE TABLE IF NOT EXISTS {db}.{tbl} (
   INDEX `expires` (`expires`)
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1"""
 MAX_THREAD_ERROR = 5
-PATH_DAILY_BACKUP = 'daily_csv/{hostname_prefix}/{table}/dt={date}/{db_name}-0000.part.lzo'
-PATH_DAILY_SUCCESS = 'daily_csv/{hostname_prefix}/{table}/dt={date}/_SUCCESS'
-PATH_DAILY_BACKUP_SHARDED_SCHEMA = 'schema/{hostname_prefix}/{table}/dt={date}/schema.sql'
-PATH_DAILY_BACKUP_NONSHARDED_SCHEMA = 'schema/{hostname_prefix}/{table}/dt={date}/{db_name}/schema.sql'
-PATH_PITR_DATA = 'pitr/{hostname_prefix}/{date}/{db_name}'
+
+PATH_PITR_DATA = 'pitr/{replica_set}/{db_name}/{date}'
 SUCCESS_ENTRY = 'YAY_IT_WORKED'
 
 log = logging.getLogger(__name__)
@@ -68,7 +66,7 @@ def main():
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None))
     # If we ever want to run multi instance, this wil need to be updated
     backup_obj = mysql_backup_csv(host_utils.HostAddr(host_utils.HOSTNAME),
-                              args.db, args.force_table, args.force_reupload)
+                                  args.db, args.force_table, args.force_reupload)
     backup_obj.backup_instance()
 
 
@@ -141,7 +139,10 @@ class mysql_backup_csv:
                 raise Exception('All worker processes have completed, but '
                                 'work remains in the queue')
 
-            log.info('CSV backup is complete')
+            log.info('CSV backup is complete, will run a check')
+            mysql_backup_status.verify_csv_backup(self.instance.replica_type,
+                                                  self.datestamp,
+                                                  self.instance)
         finally:
             if host_lock_handle:
                 log.info('Releasing general host backup lock')
@@ -227,12 +228,15 @@ class mysql_backup_csv:
         conn - a connection the the mysql instance
         """
         proc_id = multiprocessing.current_process().name
-        s3_upload_path = self.get_s3_backup_path(db, table)
+        (_, data_path, _) = environment_specific.get_csv_backup_paths(
+                                self.datestamp, db, table,
+                                self.instance.replica_type,
+                                self.instance.get_zk_replica_set()[0])
         log.debug('{proc_id}: {db}.{table} dump to {path} started'
                   ''.format(proc_id=proc_id,
                             db=db,
                             table=table,
-                            path=s3_upload_path))
+                            path=data_path))
         self.upload_schema(db, table, tmp_dir_db)
         fifo = os.path.join(tmp_dir_db, table)
         procs = dict()
@@ -262,7 +266,7 @@ class mysql_backup_csv:
             safe_uploader.safe_upload(precursor_procs=procs,
                                       stdin=procs['lzop'].stdout,
                                       bucket=environment_specific.S3_CSV_BUCKET,
-                                      key=s3_upload_path,
+                                      key=data_path,
                                       check_func=self.check_dump_success,
                                       check_arg=return_value)
             os.remove(fifo)
@@ -341,12 +345,14 @@ class mysql_backup_csv:
         cursor = conn.cursor()
         try:
             cursor.execute(sql)
-        except:
+        except Exception as detail:
             # if we have not output any data, then the cat proc will never
             # receive an EOF, so we will be stuck
             if psutil.pid_exists(cat_proc.pid):
                 cat_proc.kill()
-            log.error('dump query encountered an error')
+            log.error('{proc_id}: dump query encountered an error: {er}'
+                      ''.format(er=detail,
+                                proc_id=multiprocessing.current_process().name))
 
         log.debug('{proc_id}: {db}.{table} dump complete'
                   ''.format(proc_id=multiprocessing.current_process().name,
@@ -373,7 +379,7 @@ class mysql_backup_csv:
         pitr_data - a dict of various data that might be helpful for running a
                     PITR
         """
-        s3_path = PATH_PITR_DATA.format(hostname_prefix=self.instance.replica_type,
+        s3_path = PATH_PITR_DATA.format(replica_set=self.instance.get_zk_replica_set()[0],
                                         date=self.datestamp,
                                         db_name=db)
         log.debug('{proc_id}: {db} Uploading pitr data to {s3_path}'
@@ -393,25 +399,17 @@ class mysql_backup_csv:
         table - the table to be backed up
         tmp_dir_db - temporary storage used for all tables in the db
         """
-        if self.instance.replica_type in environment_specific.SHARDED_DBS_PREFIX_MAP:
-            if db != environment_specific.convert_shard_to_db(
-                    environment_specific.SHARDED_DBS_PREFIX_MAP[self.instance.replica_type]['example_schema']):
-                return
-            s3_path_raw = PATH_DAILY_BACKUP_SHARDED_SCHEMA
-        else:
-            s3_path_raw = PATH_DAILY_BACKUP_NONSHARDED_SCHEMA
-
-        s3_path = s3_path_raw.format(table=table,
-                                     hostname_prefix=self.instance.replica_type,
-                                     date=self.datestamp,
-                                     db_name=db)
+        (schema_path, _, _) = environment_specific.get_csv_backup_paths(
+                                     self.datestamp, db, table,
+                                     self.instance.replica_type,
+                                     self.instance.get_zk_replica_set()[0])
         create_stm = mysql_lib.show_create_table(self.instance, db, table)
-        log.debug('{proc_id}: Uploading schema to {s3_path}'
-                  ''.format(s3_path=s3_path,
+        log.debug('{proc_id}: Uploading schema to {schema_path}'
+                  ''.format(schema_path=schema_path,
                             proc_id=multiprocessing.current_process().name))
         boto_conn = boto.connect_s3()
         bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
-        key = bucket.new_key(s3_path)
+        key = bucket.new_key(schema_path)
         key.set_contents_from_string(create_stm)
 
     def take_backup_lock(self, db):
@@ -547,23 +545,34 @@ class mysql_backup_csv:
         boto_conn = boto.connect_s3()
         bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
         for table in self.get_tables_to_backup(db):
-            if not bucket.get_key(self.get_s3_backup_path(db, table=table)):
+            (_, data_path, _) = environment_specific.get_csv_backup_paths(
+                                           self.datestamp, db, table,
+                                           self.instance.replica_type,
+                                           self.instance.get_zk_replica_set()[0])
+            if not bucket.get_key(data_path):
                 return False
         return True
 
     def get_tables_to_backup(self, db):
         """ Determine which tables should be backed up in a db
 
+        Args:
+        db -  The db for which we need a list of tables eligible for backup
+
         Returns:
         a set of table names
         """
-        if self.force_table:
-            if self.force_table not in mysql_lib.get_tables(self.instance, db, skip_views=True):
-                raise Exception('Requested table {t} does not exist in db {d}'
-                                ''.format(t=self.force_table, d=db))
-            return set([self.force_table])
+        tables = environment_specific.filter_tables_to_csv_backup(
+                     self.instance, db,
+                     mysql_lib.get_tables(self.instance, db, skip_views=True))
+        if not self.force_table:
+            return tables
+
+        if self.force_table not in tables:
+            raise Exception('Requested table {t} is not available to backup'
+                            ''.format(t=self.force_table))
         else:
-            return mysql_lib.get_tables(self.instance, db, skip_views=True)
+            return set([self.force_table])
 
     def check_replication_for_backup(self):
         """ Confirm that replication is caught up enough to run """
@@ -579,21 +588,6 @@ class mysql_backup_csv:
                 log.info('Replicaiton is ok ({cur}) to run daily backup'
                          ''.format(cur=heartbeat))
                 return
-
-    def get_s3_backup_path(self, db, table):
-        """ Figure out where a given backup should exist in s3
-
-        Args:
-        db - The db of the backup
-        table - The table backed up
-
-        Returns:
-        a path to the s3 file
-        """
-        return PATH_DAILY_BACKUP.format(table=table,
-                                        hostname_prefix=self.instance.replica_type,
-                                        date=self.datestamp,
-                                        db_name=db)
 
     def setup_and_get_tmp_path(self):
         """ Figure out where to temporarily store csv backups,

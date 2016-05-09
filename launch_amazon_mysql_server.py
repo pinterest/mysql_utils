@@ -30,11 +30,11 @@ def main():
                         choices=environment_specific.SUPPORTED_AZ,
                         required=True)
     parser.add_argument('--mysql_major_version',
-                        choices=launch_replacement_db_host.SUPPORTED_MYSQL_MAJOR_VERSIONS.keys(),
+                        choices=environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS,
                         default=launch_replacement_db_host.DEFAULT_MYSQL_MAJOR_VERSION,
                         help='Default: {default}'.format(default=launch_replacement_db_host.DEFAULT_MYSQL_MAJOR_VERSION))
     parser.add_argument('--mysql_minor_version',
-                        choices=launch_replacement_db_host.SUPPORTED_MYSQL_MINOR_VERSIONS,
+                        choices=environment_specific.SUPPORTED_MYSQL_MINOR_VERSIONS,
                         default=launch_replacement_db_host.DEFAULT_MYSQL_MINOR_VERSION,
                         help='Default: {default}'.format(default=launch_replacement_db_host.DEFAULT_MYSQL_MINOR_VERSION))
     parser.add_argument('--dry_run',
@@ -111,7 +111,7 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group, clas
 
     hiera_config = environment_specific.HIERA_FORMAT.format(
         ssh_security=ssh_security,
-        mysql_major_version=launch_replacement_db_host.SUPPORTED_MYSQL_MAJOR_VERSIONS[mysql_major_version],
+        mysql_major_version=mysql_major_version.replace('.', ''),
         mysql_minor_version=mysql_minor_version)
     if hiera_config not in environment_specific.SUPPORTED_HIERA_CONFIGS:
         raise Exception('Hiera config {hiera_config} is not supported.'

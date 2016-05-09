@@ -18,8 +18,10 @@ DIRS_TO_CREATE = ['datadir', 'log_bin', 'log_error',
 # in MySQL 5.5+, log_slow_queries is deprecated in favor of
 # slow_query_log_file
 FILES_TO_CLEAR = ['log_slow_queries', 'log_error', 'slow_query_log_file']
-MYSQL_INSTALL_DB = '/usr/bin/mysql_install_db'
 
+# If MySQL 5.7+, don't use mysql_install_db
+MYSQL_INSTALL_DB = '/usr/bin/mysql_install_db'
+MYSQL_INITIALIZE = '/usr/sbin/mysqld --initialize-insecure'
 log = environment_specific.setup_logging_defaults(__name__)
 
 
@@ -215,9 +217,15 @@ def init_privileges_tables(port):
     Args:
     port - the port on which to act upon on localhost
     """
+    version = mysql_lib.get_installed_mysqld_version()
+    if version[0:3] < '5.7':
+        install_command = MYSQL_INSTALL_DB
+    else:
+        install_command = MYSQL_INITIALIZE
+
     datadir = host_utils.get_cnf_setting('datadir', port)
     cmd = ('{MYSQL_INSTALL_DB} --datadir={datadir}'
-           ' --user=mysql'.format(MYSQL_INSTALL_DB=MYSQL_INSTALL_DB,
+           ' --user=mysql'.format(MYSQL_INSTALL_DB=install_command,
                                   datadir=datadir))
     log.info(cmd)
     (std_out, std_err, return_code) = host_utils.shell_exec(cmd)

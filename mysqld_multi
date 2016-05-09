@@ -686,7 +686,7 @@ sub list_defaults_files
 }
 
 
-# Takes a specification of GNRs (see --help), and returns a list of matching
+# Takes a specification of GNRs (see --help), and returns a unique list of matching
 # groups which actually are mentioned in a relevant config file
 sub find_groups
 {
@@ -719,6 +719,8 @@ sub find_groups
 
   my @defaults_files = list_defaults_files();
   #warn "@{[sort keys %gids]} -> @defaults_files\n";
+
+  my %unique_groups;
   foreach my $file (@defaults_files)
   {
     next unless open CONF, "< $file";
@@ -731,14 +733,14 @@ sub find_groups
         # Use $2 + 0 to normalize numbers (002 + 0 -> 2)
         if (not defined($raw_gids) or $gids{$2 + 0})
         {
-          push @groups, "$1$2";
+          $unique_groups{"$1$2"}++;
         }
       }
     }
 
     close CONF;
   }
-  return @groups;
+  return (keys %unique_groups);
 }
 
 ####

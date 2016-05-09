@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import time
+import psutil
 
 import modify_mysql_zk
 import mysql_backup
@@ -169,8 +170,12 @@ def restore_instance(restore_source, destination,
         log.info('Decompressing files in {path}'.format(path=datadir))
         backup.innobackup_decompress(destination.port)
 
+        # Determine how much RAM to use for applying logs based on the
+        # system's total RAM size; all our boxes have 32G or more, so
+        # this will always be better than before, but not absurdly high.
+        log_apply_ram = psutil.phymem_usage()[0] / 1024 / 1024 / 1024 / 3
         log.info('Applying logs')
-        backup.apply_log(destination.port, memory='10G')
+        backup.apply_log(destination.port, memory='{}G'.format(log_apply_ram))
 
         log.info('Removing old innodb redo logs')
         mysql_init_server.delete_innodb_log_files(destination.port)

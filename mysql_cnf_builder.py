@@ -39,13 +39,14 @@ READ_ONLY_OFF = 'OFF'
 READ_ONLY_ON = 'ON'
 SAFE_UPDATE_PREFIXES = set(['sharddb', 'modsharddb'])
 SAFE_UPDATES_SQL = 'set global sql_safe_updates=on;'
-SUPPORTED_VERSION = set(['5.5', '5.6'])
 TOUCH_FOR_NO_CONFIG_OVERWRITE = '/etc/mysql/no_write_config'
 TOUCH_FOR_WRITABLE_IF_NOT_IN_ZK = '/etc/mysql/make_non_zk_server_writeable'
 UPGRADE_OVERRIDE_SETTINGS = {'skip_slave_start': None,
-                             'skip_networking': None}
+                             'skip_networking': None,
+                             'innodb_fast_shutdown': '0'}
 UPGRADE_REMOVAL_SETTINGS = set(['enforce_storage_engine',
-                                'init_file'])
+                                'init_file',
+                                'disabled_storage_engines'])
 
 
 log = environment_specific.setup_logging_defaults(__name__)
@@ -67,7 +68,7 @@ def main():
                         help='Useful for testing.  Set the MySQL version to '
                              'build the configs for.  Allows running this '
                              'script on hosts without MySQL installed.',
-                        choices=SUPPORTED_VERSION)
+                        choices=environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS)
     args = parser.parse_args()
     if args.override_hostname:
         override_host = host_utils.HostAddr(args.override_hostname)
@@ -94,7 +95,7 @@ def build_cnf(host=None,
     else:
         major_version = mysql_lib.get_installed_mysqld_version()[:3]
 
-    if major_version not in SUPPORTED_VERSION:
+    if major_version not in environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS:
         log.info('CNF building is not supported in '
                  '{major_version}'.format(major_version=major_version))
         return

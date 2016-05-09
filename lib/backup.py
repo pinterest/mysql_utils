@@ -19,9 +19,10 @@ BACKUP_LOCK_FILE = '/tmp/backup_mysql.lock'
 BACKUP_TYPE_LOGICAL = 'sql.gz'
 BACKUP_TYPE_CSV = 'csv'
 BACKUP_TYPE_XBSTREAM = 'xbstream'
-BACKUP_TYPES = set([BACKUP_TYPE_LOGICAL, BACKUP_TYPE_XBSTREAM, BACKUP_TYPE_CSV])
+BACKUP_TYPES = set([BACKUP_TYPE_LOGICAL, BACKUP_TYPE_XBSTREAM,
+                    BACKUP_TYPE_CSV])
 INNOBACKUPEX = '/usr/bin/innobackupex'
-INNOBACKUP_OK = 'innobackupex: completed OK!'
+INNOBACKUP_OK = 'completed OK!'
 MYSQLDUMP = '/usr/bin/mysqldump'
 MYSQLDUMP_CMD = ' '.join((MYSQLDUMP,
                           '--master-data',
@@ -41,21 +42,26 @@ USER_ROLE_XTRABACKUP = 'xtrabackup'
 XB_RESTORE_STATUS = ("CREATE TABLE IF NOT EXISTS test.xb_restore_status ("
                      "id                INT UNSIGNED NOT NULL AUTO_INCREMENT, "
                      "restore_source    VARCHAR(64), "
-                     "restore_type      ENUM('s3', 'remote_server', 'local_file') NOT NULL, "
+                     "restore_type      ENUM('s3', 'remote_server', "
+                     "                       'local_file') NOT NULL, "
                      "test_restore      ENUM('normal', 'test') NOT NULL, "
                      "restore_destination   VARCHAR(64), "
                      "restore_date      DATE, "
-                     "restore_port      SMALLINT UNSIGNED NOT NULL DEFAULT 3306, "
+                     "restore_port      SMALLINT UNSIGNED NOT NULL "
+                     "                  DEFAULT 3306, "
                      "restore_file      VARCHAR(255), "
                      "replication       ENUM('SKIP', 'REQ', 'OK', 'FAIL'), "
                      "zookeeper         ENUM('SKIP', 'REQ', 'OK', 'FAIL'), "
                      "started_at        DATETIME NOT NULL, "
                      "finished_at       DATETIME, "
-                     "restore_status    ENUM('OK', 'IPR', 'BAD') DEFAULT 'IPR', "
+                     "restore_status    ENUM('OK', 'IPR', 'BAD') "
+                     "                  DEFAULT 'IPR', "
                      "status_message    TEXT, "
                      "PRIMARY KEY(id), "
                      "INDEX (restore_type, started_at), "
-                     "INDEX (restore_type, restore_status, started_at) )")
+                     "INDEX (restore_type, restore_status, "
+                     "       started_at) )")
+
 XTRABACKUP_CMD = ' '.join((INNOBACKUPEX,
                            '{datadir}',
                            '--slave-info',
@@ -153,7 +159,8 @@ def get_metadata_from_backup_file(full_path):
     pattern = 'mysql-([a-z0-9-]+)-(330[0-9])-(\d{4})-(\d{2})-(\d{2}).*\.(.+)'
     res = re.match(pattern, filename)
     host = host_utils.HostAddr(':'.join((res.group(1), res.group(2))))
-    creation = datetime.date(int(res.group(3)), int(res.group(4)), int(res.group(5)))
+    creation = datetime.date(int(res.group(3)), int(res.group(4)),
+                             int(res.group(5)))
     extension = res.group(6)
     return host, creation, extension
 
@@ -173,7 +180,8 @@ def logical_backup_instance(instance, timestamp):
                                    timestamp=time.strftime('%Y-%m-%d-%H:%M:%S',
                                                            timestamp),
                                    backup_type=BACKUP_TYPE_LOGICAL)
-    dump_user, dump_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_MYSQLDUMP)
+    (dump_user,
+     dump_pass) = mysql_lib.get_mysql_user_for_role(USER_ROLE_MYSQLDUMP)
     dump_cmd = MYSQLDUMP_CMD.format(dump_user=dump_user,
                                     dump_pass=dump_pass,
                                     host=instance.hostname,
@@ -210,22 +218,21 @@ def xtrabackup_instance(instance, timestamp):
     """
     # Prevent issues with too many open files
     resource.setrlimit(resource.RLIMIT_NOFILE, (131072, 131072))
-    backup_file = BACKUP_FILE.format(hostname=instance.hostname,
-                                     port=instance.port,
-                                     timestamp=time.strftime('%Y-%m-%d-%H:%M:%S', timestamp),
-                                     backup_type=BACKUP_TYPE_XBSTREAM)
+    backup_file = BACKUP_FILE.format(
+            hostname=instance.hostname,
+            port=instance.port,
+            timestamp=time.strftime('%Y-%m-%d-%H:%M:%S', timestamp),
+            backup_type=BACKUP_TYPE_XBSTREAM)
 
     tmp_log = os.path.join(environment_specific.RAID_MOUNT,
-                           'log',
-                           ''.join(['xtrabackup_',
-                                    time.strftime('%Y-%m-%d-%H:%M:%S', timestamp),
-                                    '.log']))
+                           'log', 'xtrabackup_{ts}.log'.format(
+                            ts=time.strftime('%Y-%m-%d-%H:%M:%S', timestamp)))
     tmp_log_handle = open(tmp_log, "w")
     procs = dict()
     try:
-        procs['xtrabackup'] = subprocess.Popen(create_xtrabackup_command(instance, timestamp, tmp_log),
-                                               stdout=subprocess.PIPE,
-                                               stderr=tmp_log_handle)
+        procs['xtrabackup'] = subprocess.Popen(
+            create_xtrabackup_command(instance, timestamp, tmp_log),
+            stdout=subprocess.PIPE, stderr=tmp_log_handle)
         log.info('Uploading backup to {buk}/{loc}'
                  ''.format(buk=environment_specific.S3_BUCKET,
                            loc=backup_file))
@@ -272,7 +279,8 @@ def create_xtrabackup_command(instance, timestamp, tmp_log):
         cnf = host_utils.MYSQL_CNF_FILE
         cnf_group = 'mysqld{port}'.format(port=instance.port)
     datadir = host_utils.get_cnf_setting('datadir', instance.port)
-    xtra_user, xtra_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_XTRABACKUP)
+    (xtra_user,
+     xtra_pass) = mysql_lib.get_mysql_user_for_role(USER_ROLE_XTRABACKUP)
     return XTRABACKUP_CMD.format(datadir=datadir,
                                  xtra_user=xtra_user,
                                  xtra_pass=xtra_pass,
@@ -301,7 +309,7 @@ def xbstream_unpack(xbstream, port, restore_source, size=None):
         cmd = ' | '.join((cmd, '{pv} -s {size}'.format(pv=PV,
                                                        size=str(size))))
     # And finally pipe everything into xbstream to unpack it
-    cmd = ' | '.join((cmd, '/usr/bin/xbstream -x -C {datadir}'.format(datadir=datadir)))
+    cmd = ' | '.join((cmd, '/usr/bin/xbstream -x -C {}'.format(datadir)))
     log.info(cmd)
 
     extract = subprocess.Popen(cmd, shell=True)
@@ -341,9 +349,9 @@ def innobackup_decompress(port, threads=8):
 
         err_handle.seek(0)
         log_data = err_handle.readlines()
-        if 'innobackupex: completed OK!' not in log_data[-1]:
-            msg = ('Fatal error: innobackupex decompress did not end with ',
-                   '"innobackupex: completed OK"')
+        if INNOBACKUP_OK not in log_data[-1]:
+            msg = ('Fatal error: innobackupex decompress did not end with '
+                   '"{}"'.format(INNOBACKUP_OK))
             raise Exception(msg)
 
 
@@ -374,9 +382,9 @@ def apply_log(port, memory='10G'):
 
         log_handle.seek(0)
         log_data = log_handle.readlines()
-        if 'innobackupex: completed OK!' not in log_data[-1]:
-            msg = ('Fatal error: innobackupex apply-log did not end with ',
-                   '"innobackupex: completed OK"')
+        if INNOBACKUP_OK not in log_data[-1]:
+            msg = ('Fatal error: innobackupex apply-log did not end with '
+                   '"{}"'.format(INNOBACKUP_OK))
             raise Exception(msg)
 
 
@@ -503,8 +511,7 @@ def update_restore_log(instance, row_id, params):
         updates_fields.append('finished_at=NOW()')
 
     sql = ("UPDATE test.xb_restore_status SET "
-           + ', '.join(updates_fields) +
-           " WHERE id = %(row_id)s")
+           "{} WHERE id=%(row_id)s".format(', '.join(updates_fields)))
     params['row_id'] = row_id
     cursor = conn.cursor()
     cursor.execute(sql, params)

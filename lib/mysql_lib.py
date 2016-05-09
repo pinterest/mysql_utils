@@ -55,7 +55,6 @@ REPLICATION_TOLERANCE_NONE = 'None'
 REPLICATION_TOLERANCE_NORMAL = 'Normal'
 REPLICATION_TOLERANCE_LOOSE = 'Loose'
 
-
 class ReplicationError(Exception):
     pass
 
@@ -563,7 +562,7 @@ def setup_response_time_metrics(instance):
     cursor = conn.cursor()
 
     version = get_global_variables(instance)['version']
-    if version[0:3] != '5.6':
+    if version[0:3] < '5.6':
         return
 
     try:

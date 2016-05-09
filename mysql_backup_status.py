@@ -1,21 +1,13 @@
 #!/usr/bin/python
-"""
-    MySQL backup verification utility based on current list of replica servers
-    in ZooKeeper and what is present in s3. If a discrepancy is found,
-    exits 1 and shows errors.
-"""
-
-__author__ = ("rwultsch@pinterest.com (Rob Wultsch)")
-
-
 import argparse
+import copy
 import datetime
+import multiprocessing
 import os
 import sys
 import pprint
 
 import boto
-
 import mysql_backup_csv
 from lib import backup
 from lib import environment_specific
@@ -26,9 +18,15 @@ from lib import mysql_lib
 BACKUP_OK_RETURN = 0
 BACKUP_MISSING_RETURN = 1
 BACKUP_NOT_IN_ZK_RETURN = 127
+CSV_CHECK_PROCESSES = 8
 CSV_STARTUP = datetime.time(0, 15)
 CSV_COMPLETION_TIME = datetime.time(2, 30)
 MISSING_BACKUP_VERBOSE_LIMIT = 20
+CSV_BACKUP_LOG_TABLE_DEFINITION = """CREATE TABLE {db}.{tbl} (
+ `backup_date` date NOT NULL,
+ `completion` datetime DEFAULT NULL,
+ PRIMARY KEY (`backup_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1 """
 
 
 def find_mysql_backup(replica_set, date, backup_type):
@@ -59,6 +57,107 @@ def find_mysql_backup(replica_set, date, backup_type):
     return None
 
 
+def verify_csv_backup(shard_type, date, instance=None):
+    """ Verify csv backup(s)
+
+    Args:
+    shard_type - Type of mysql db
+    date - date as a string
+    instance - (optional) HostAddr instance
+
+    Returns:
+    True if backup is verified, false otherwise
+    """
+    if instance and csv_backup_success_logged(instance, date):
+        print ('Per csv backup success log, backup has already been '
+               'verified')
+        return True
+
+    if instance and early_verification(date, instance):
+        print 'Backups are currently running'
+        return True
+
+    if shard_type in environment_specific.SHARDED_DBS_PREFIX_MAP:
+        ret = verify_sharded_csv_backup(shard_type, date, instance)
+    elif shard_type in environment_specific.FLEXSHARD_DBS:
+        ret = verify_flexsharded_csv_backup(shard_type, date, instance)
+    else:
+        ret = verify_unsharded_csv_backup(shard_type, date, instance)
+
+    if instance and ret:
+        log_csv_backup_success(instance, date)
+
+    return ret
+
+
+def verify_flexsharded_csv_backup(shard_type, date, instance=None):
+    """ Verify that a flexsharded data set has been backed up to hive
+
+    Args:
+    shard_type -  i.e. 'commercefeeddb', etc
+    date - The date to search for
+    instance - Restrict the search to problem on a single instnace
+
+    Returns True for no problems found, False otherwise.
+    """
+    success = True
+    replica_sets = set()
+    zk = host_utils.MysqlZookeeper()
+    if instance:
+        replica_sets.add(zk.get_replica_set_from_instance(instance)[0])
+    else:
+        for replica_set in zk.get_all_mysql_replica_sets():
+            if replica_set.startswith(environment_specific.FLEXSHARD_DBS[shard_type]['zk_prefix']):
+                replica_sets.add(replica_set)
+
+    schema_host = zk.get_mysql_instance_from_replica_set(
+            environment_specific.FLEXSHARD_DBS[shard_type]['example_shard_replica_set'],
+            repl_type=host_utils.REPLICA_ROLE_SLAVE)
+
+    boto_conn = boto.connect_s3()
+    bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
+    missing_uploads = set()
+
+    for db in mysql_lib.get_dbs(schema_host):
+        for table in mysql_backup_csv.mysql_backup_csv(schema_host).get_tables_to_backup(db):
+            if not verify_csv_schema_upload(shard_type, date, schema_host, db, [table]):
+                success = False
+                continue
+
+            table_missing_uploads = set()
+            for replica_set in replica_sets:
+                chk_instance = zk.get_mysql_instance_from_replica_set(replica_set)
+                (_, data_path, success_path) = environment_specific.get_csv_backup_paths(
+                                                   date, db, table, chk_instance.replica_type,
+                                                   chk_instance.get_zk_replica_set()[0])
+                if not bucket.get_key(data_path):
+                    table_missing_uploads.add(data_path)
+                    success = False
+
+            if not table_missing_uploads and not instance:
+                if not bucket.get_key(success_path):
+                    print 'Creating success key {key}'.format(key=success_path)
+                    key = bucket.new_key(success_path)
+                    key.set_contents_from_string('')
+
+            missing_uploads.update(table_missing_uploads)
+
+    if missing_uploads:
+        if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
+            print ('Shard type {shard_type} is missing uploads:'
+                   ''.format(shard_type=shard_type))
+            pprint.pprint(missing_uploads)
+        else:
+            print ('Shard type {shard_type} is missing {num} uploads'
+                   ''.format(num=len(missing_uploads),
+                             shard_type=shard_type))
+
+    if not missing_uploads and not instance and success:
+        print 'Shard type {shard_type} is backed up'.format(shard_type=shard_type)
+
+    return success
+
+
 def verify_sharded_csv_backup(shard_type, date, instance=None):
     """ Verify that a sharded data set has been backed up to hive
 
@@ -69,36 +168,12 @@ def verify_sharded_csv_backup(shard_type, date, instance=None):
 
     Returns True for no problems found, False otherwise.
     """
-
-    if instance:
-        # if we are running the check on a specific instance, we will add in
-        # some additional logic to not cause false alarms during the backup
-        # process.
-        if (date == (datetime.datetime.utcnow().date() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")):
-            # For todays date, we give CSV_STARTUP minutes before checking anything.
-            if datetime.datetime.utcnow().time() < CSV_STARTUP:
-                print 'Backup startup time has not yet passed'
-                return True
-
-            if datetime.datetime.utcnow().time() < CSV_COMPLETION_TIME:
-                # For todays date, until after CSV_COMPLETION_TIME it is good enough
-                # to check if backups are running. If they are running, everything
-                # is ok. If they are not running, we will do all the normal checks.
-                if csv_backups_running(instance):
-                    print 'Backup running on {i}'.format(i=instance)
-                    return True
-
-    schema_db = environment_specific.SHARDED_DBS_PREFIX_MAP[shard_type]['example_schema']
     zk = host_utils.MysqlZookeeper()
-    schema_host = zk.shard_to_instance(schema_db, repl_type=host_utils.REPLICA_ROLE_SLAVE)
-    (success, tables) = \
-        verify_csv_schema_upload(shard_type, date, schema_host, schema_db,
-                                 mysql_backup_csv.PATH_DAILY_BACKUP_SHARDED_SCHEMA)
-
-    if not success:
-        # problem with schema, don't bother verifying data
-        return False
-
+    example_shard = environment_specific.SHARDED_DBS_PREFIX_MAP[shard_type]['example_shard']
+    schema_host = zk.shard_to_instance(example_shard, repl_type=host_utils.REPLICA_ROLE_SLAVE)
+    tables = mysql_backup_csv.mysql_backup_csv(schema_host).get_tables_to_backup(environment_specific.convert_shard_to_db(example_shard))
+    success = verify_csv_schema_upload(shard_type, date, schema_host,
+                                       environment_specific.convert_shard_to_db(example_shard), tables)
     if instance:
         host_shard_map = zk.get_host_shard_map()
         (replica_set, replica_type) = zk.get_replica_set_from_instance(instance)
@@ -107,49 +182,91 @@ def verify_sharded_csv_backup(shard_type, date, instance=None):
     else:
         shards = zk.get_shards_by_shard_type(shard_type)
 
-    missing_uploads = set()
+    pool = multiprocessing.Pool(processes=CSV_CHECK_PROCESSES)
+    pool_args = list()
+    if not tables:
+        raise Exception('No tables will be checked for backups')
+    if not shards:
+        raise Exception('No shards will be checked for backups')
+
     for table in tables:
-        expected_s3_keys = set()
-        prefix = None
-        for shard in shards:
-            key = mysql_backup_csv.PATH_DAILY_BACKUP.format(table=table,
-                                                            hostname_prefix=shard_type,
-                                                            date=date,
-                                                            db_name=environment_specific.convert_shard_to_db(shard))
-            expected_s3_keys.add(key)
-            if not prefix:
-                prefix = os.path.dirname(key)
+        pool_args.append((table, shard_type, date, shards))
+    results = pool.map(get_missing_uploads, pool_args)
+    missing_uploads = set()
+    for result in results:
+        missing_uploads.update(result)
 
-        boto_conn = boto.connect_s3()
-        bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
-        uploaded_keys = set()
-        for key in bucket.list(prefix=prefix):
-            uploaded_keys.add(key.name)
-        missing = expected_s3_keys.difference(uploaded_keys)
-        if missing and table not in environment_specific.IGNORABLE_MISSING_TABLES:
-            missing_uploads.update(missing)
-
-    if missing_uploads:
+    if missing_uploads or not success:
         if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
-            print 'Missing uploads: {uploads}'.format(uploads=missing_uploads)
+            print ('Shard type {shard_type} is missing uploads:'
+                   ''.format(shard_type=shard_type))
+            pprint.pprint(missing_uploads)
         else:
-            print 'Missing {num} uploads'.format(num=len(missing_uploads))
+            print ('Shard type {shard_type} is missing {num} uploads'
+                   ''.format(num=len(missing_uploads),
+                             shard_type=shard_type))
         return False
     else:
-        if not instance:
+        if instance:
+            print 'Instance {instance} is backed up'.format(instance=instance)
+        else:
             # we have checked all shards, all are good, create success files
+            boto_conn = boto.connect_s3()
+            bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
             for table in tables:
-                key_name = mysql_backup_csv.PATH_DAILY_SUCCESS.format(table=table,
-                                                                      hostname_prefix=shard_type,
-                                                                      date=date)
-                if bucket.get_key(key_name):
-                    print 'Key already exists {key}'.format(key=key)
-                else:
-                    print 'Creating success key {key}'.format(key=key)
-                    key = bucket.new_key(key_name)
+                (_, _, success_path) = environment_specific.get_csv_backup_paths(date,
+                                                                                 environment_specific.convert_shard_to_db(example_shard),
+                                                                                 table, shard_type)
+                if not bucket.get_key(success_path):
+                    print 'Creating success key {key}'.format(key=success_path)
+                    key = bucket.new_key(success_path)
                     key.set_contents_from_string('')
+            print 'Shard type {shard_type} is backed up'.format(shard_type=shard_type)
 
         return True
+
+
+def get_missing_uploads(args):
+    """ Check to see if all backups are present
+
+    Args: A tuple which can be expanded to:
+    table - table name
+    shard_type -  sharddb, etc
+    shards -  a set of shards
+
+    Returns: a set of shards which are not backed up
+    """
+    (table, shard_type, date, shards) = args
+    expected_s3_keys = set()
+    prefix = None
+
+    for shard in shards:
+        (_, data_path, _) = environment_specific.get_csv_backup_paths(
+                                date, environment_specific.convert_shard_to_db(shard),
+                                table, shard_type)
+        expected_s3_keys.add(data_path)
+        if not prefix:
+            prefix = os.path.dirname(data_path)
+
+    boto_conn = boto.connect_s3()
+    bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
+    uploaded_keys = set()
+    for key in bucket.list(prefix=prefix):
+        uploaded_keys.add(key.name)
+
+    missing_uploads = expected_s3_keys.difference(uploaded_keys)
+
+    for entry in copy.copy(missing_uploads):
+        # the list api occassionally has issues, so we will recheck any missing
+        # entries. If any are actually missing we will quit checking because
+        # there is definitely work that needs to be done
+        if bucket.get_key(entry):
+            print 'List method erronious did not return data for key:{entry}'.format(entry=entry)
+            missing_uploads.discard(entry)
+        else:
+            return missing_uploads
+
+    return missing_uploads
 
 
 def verify_unsharded_csv_backup(shard_type, date, instance):
@@ -161,6 +278,58 @@ def verify_unsharded_csv_backup(shard_type, date, instance):
     instance - The actual instance to inspect for backups being done
 
     Returns True for no problems found, False otherwise.
+    """
+    return_status = True
+    boto_conn = boto.connect_s3()
+    bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
+    missing_uploads = set()
+    for db in mysql_lib.get_dbs(instance):
+        tables = mysql_backup_csv.mysql_backup_csv(instance).get_tables_to_backup(db)
+        for table in tables:
+            if not verify_csv_schema_upload(shard_type, date, instance, db,
+                                            set([table])):
+                return_status = False
+                print 'Missing schema for {db}.{table}'.format(db=db,
+                                                               table=table)
+                continue
+
+            (_, data_path, success_path) = \
+                environment_specific.get_csv_backup_paths(date, db, table,
+                                                          instance.replica_type,
+                                                          instance.get_zk_replica_set()[0])
+            if not bucket.get_key(data_path):
+                missing_uploads.add(data_path)
+            else:
+                # we still need to create a success file for the data
+                # team for this table, even if something else is AWOL
+                # later in the backup.
+                if bucket.get_key(success_path):
+                    print 'Key already exists {key}'.format(key=success_path)
+                else:
+                    print 'Creating success key {key}'.format(key=success_path)
+                    key = bucket.new_key(success_path)
+                    key.set_contents_from_string('')
+
+    if missing_uploads:
+        if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
+            print 'Missing uploads: {uploads}'.format(uploads=missing_uploads)
+        else:
+            print 'Missing {num} uploads'.format(num=len(missing_uploads))
+        return_status = False
+
+    return return_status
+
+
+def early_verification(date, instance):
+    """ Just after UTC midnight we don't care about backups. For a bit after
+        that we just care that backups are running
+
+    Args:
+    date - The backup date to check
+    instance - What instance is being checked
+
+    Returns:
+    True if backups are running or it is too early, False otherwise
     """
     if (date == (datetime.datetime.utcnow().date() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")):
         if datetime.datetime.utcnow().time() < CSV_STARTUP:
@@ -175,51 +344,6 @@ def verify_unsharded_csv_backup(shard_type, date, instance):
             if csv_backups_running(instance):
                 print 'Backup running on {i}'.format(i=instance)
                 return True
-
-    return_status = True
-    for db in mysql_lib.get_dbs(instance):
-        (success, _) = \
-            verify_csv_schema_upload(shard_type, date, instance, db,
-                                     mysql_backup_csv.PATH_DAILY_BACKUP_NONSHARDED_SCHEMA)
-        if not success:
-            return_status = False
-
-    if not return_status:
-        print 'missing schema file'
-        # problem with schema, don't bother verifying data
-        return return_status
-
-    boto_conn = boto.connect_s3()
-    bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
-    missing_uploads = set()
-    for db in mysql_lib.get_dbs(instance):
-        for table in mysql_lib.get_tables(instance, db, skip_views=True):
-            key = mysql_backup_csv.PATH_DAILY_BACKUP.format(table=table,
-                                                            hostname_prefix=shard_type,
-                                                            date=date,
-                                                            db_name=db)
-            if not bucket.get_key(key):
-                missing_uploads.add(key)
-            else:
-                # we still need to create a success file for the data
-                # team for this table, even if something else is AWOL
-                # later in the backup.
-                key_name = mysql_backup_csv.PATH_DAILY_SUCCESS.format(
-                        table=table, hostname_prefix=shard_type, date=date)
-                if bucket.get_key(key_name):
-                    print 'Key already exists {key}'.format(key=key_name)
-                else:
-                    print 'Creating success key {key}'.format(key=key_name)
-                    key = bucket.new_key(key_name)
-                    key.set_contents_from_string('')
-
-    if missing_uploads:
-        if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
-            print 'Missing uploads: {uploads}'.format(uploads=missing_uploads)
-        else:
-            print 'Missing {num} uploads'.format(num=len(missing_uploads))
-    else:
-        return True
 
 
 def csv_backups_running(instance):
@@ -246,36 +370,97 @@ def csv_backups_running(instance):
     return False
 
 
-def verify_csv_schema_upload(shard_type, date, schema_host, schema_db,
-                             schema_upload_path_raw):
+def log_csv_backup_success(instance, date):
+    """ The CSV backup check can be expensive, so let's log that it is done
+
+    Args:
+    instance - A hostaddr object
+    date - a string for the date
+    """
+    zk = host_utils.MysqlZookeeper()
+    replica_set = zk.get_replica_set_from_instance(instance)[0]
+    master = zk.get_mysql_instance_from_replica_set(replica_set)
+    conn = mysql_lib.connect_mysql(master, 'scriptrw')
+    cursor = conn.cursor()
+
+    if not mysql_lib.does_table_exist(master, mysql_lib.METADATA_DB,
+                                      environment_specific.CSV_BACKUP_LOG_TABLE):
+            print 'Creating missing metadata table'
+            cursor.execute(CSV_BACKUP_LOG_TABLE_DEFINITION.format(
+                               db=mysql_lib.METADATA_DB,
+                               tbl=environment_specific.CSV_BACKUP_LOG_TABLE))
+
+    sql = ('INSERT IGNORE INTO {METADATA_DB}.{CSV_BACKUP_LOG_TABLE} '
+           'SET backup_date = %(date)s, '
+           'completion = NOW()'
+           ''.format(METADATA_DB=mysql_lib.METADATA_DB,
+                     CSV_BACKUP_LOG_TABLE=environment_specific.CSV_BACKUP_LOG_TABLE))
+    cursor.execute(sql, {'date': date})
+    conn.commit()
+
+
+def csv_backup_success_logged(instance, date):
+    """ Check for log entries created by log_csv_backup_success
+
+    Args:
+    instance - A hostaddr object
+    date - a string for the date
+
+    Returns:
+    True if already backed up, False otherwise
+    """
+    zk = host_utils.MysqlZookeeper()
+    replica_set = zk.get_replica_set_from_instance(instance)[0]
+    master = zk.get_mysql_instance_from_replica_set(replica_set)
+    conn = mysql_lib.connect_mysql(master, 'scriptrw')
+    cursor = conn.cursor()
+
+    if not mysql_lib.does_table_exist(master, mysql_lib.METADATA_DB,
+                                      environment_specific.CSV_BACKUP_LOG_TABLE):
+        return False
+
+    sql = ('SELECT COUNT(*) as "cnt" '
+           'FROM {METADATA_DB}.{CSV_BACKUP_LOG_TABLE} '
+           'WHERE backup_date = %(date)s '
+           ''.format(METADATA_DB=mysql_lib.METADATA_DB,
+                     CSV_BACKUP_LOG_TABLE=environment_specific.CSV_BACKUP_LOG_TABLE))
+    cursor.execute(sql, {'date': date})
+    if cursor.fetchone()["cnt"]:
+        return True
+    else:
+        return False
+
+
+def verify_csv_schema_upload(shard_type, date, instance, schema_db,
+                             tables):
     """ Confirm that schema files are uploaded
 
     Args:
     shard_type - In this case, a hostname or shard type (generally
                  one in the same)
     date - The date to search for
-    schema_host - A for to examine to find which tables should exist
+    schema_host - A host to examine to find which tables should exist
     schema_db - Which db to inxpect on schema_host
-    schema_upload_path_raw - A string that can be format'ed in order to create
-                             a S3 key path
+    tables - A set of which tables to check in schema_db for schema upload
 
     Returns True for no problems found, False otherwise.
     """
+    return_status = True
+    missing = set()
     boto_conn = boto.connect_s3()
     bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
-    tables = mysql_lib.get_tables(schema_host,
-                                  environment_specific.convert_shard_to_db(schema_db),
-                                  skip_views=True)
-    return_status = True
     for table in tables:
-        path = schema_upload_path_raw.format(table=table,
-                                             hostname_prefix=shard_type,
-                                             date=date,
-                                             db_name=schema_db)
+        (path, _, _) = environment_specific.get_csv_backup_paths(
+                           date, schema_db, table,
+                           instance.replica_type,
+                           instance.get_zk_replica_set()[0])
         if not bucket.get_key(path):
-            print 'Expected key {key} is missing'.format(key=path)
+            missing.add(path)
             return_status = False
-    return return_status, tables
+
+    if missing:
+        print 'Expected schema files are missing: {missing}'.format(missing=missing)
+    return return_status
 
 
 def main():
@@ -304,7 +489,8 @@ def main():
                         '--shard_type',
                         default=None,
                         help='Used for csv backups for success file creation',
-                        choices=environment_specific.SHARDED_DBS_PREFIX_MAP)
+                        choices=(environment_specific.SHARDED_DBS_PREFIX_MAP.keys() +
+                                 environment_specific.FLEXSHARD_DBS.keys()))
     parser.add_argument("-a",
                         "--all",
                         action='store_true',
@@ -350,33 +536,33 @@ def main():
         else:
             instance = None
 
+        if args.all:
+            if instance:
+                raise Exception('Arguments all and instance can not be '
+                                'used together')
+            shard_types = (environment_specific.SHARDED_DBS_PREFIX_MAP.keys() +
+                           environment_specific.FLEXSHARD_DBS.keys())
+        else:
+            if args.shard_type:
+                shard_types = [args.shard_type]
+            else:
+                shard_types = [instance.replica_type]
+
+        if not shard_types and not instance:
+            raise Exception('For CSV backup verification, either a shard type '
+                            'or an instance is required')
+
         # by convention, the csv backup files use the previous days date
         split_date = args.date.split('-')
-        date = (datetime.date(int(split_date[0]), int(split_date[1]), int(split_date[2]))
-                - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        date = (datetime.date(int(split_date[0]),
+                              int(split_date[1]),
+                              int(split_date[2])) -
+                datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-        if args.all:
-            for shard_type in environment_specific.SHARDED_DBS_PREFIX_MAP:
-                print "checking {shard_type}".format(shard_type=shard_type)
-                if not verify_sharded_csv_backup(shard_type, date, instance):
-                    return_code = BACKUP_MISSING_RETURN
-        else:
-            if not args.shard_type and not instance:
-                raise Exception('For CSV backup verification, either a shard type '
-                                'or an instance is required')
+        for shard_type in shard_types:
+            if not verify_csv_backup(shard_type, date, instance):
+                return_code = BACKUP_MISSING_RETURN
 
-            if args.shard_type:
-                shard_type = args.shard_type
-            else:
-                shard_type = instance.replica_type
-
-            # Make sure the schema files are uploaded
-            if shard_type in environment_specific.SHARDED_DBS_PREFIX_MAP:
-                if not verify_sharded_csv_backup(shard_type, date, instance):
-                    return_code = BACKUP_MISSING_RETURN
-            else:
-                if not verify_unsharded_csv_backup(shard_type, date, instance):
-                    return_code = BACKUP_MISSING_RETURN
     else:
         raise Exception('Backup type unsupported')
 

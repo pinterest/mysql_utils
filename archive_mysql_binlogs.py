@@ -27,6 +27,7 @@ BINLOG_ARCHIVING_TABLE = """CREATE TABLE IF NOT EXISTS {db}.{tbl} (
   INDEX `uploaded` (`uploaded`),
   INDEX `binlog_creation` (`binlog_creation`)
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1"""
+BINLOG_S3_BASE_DIR = 'binlogs'
 STANDARD_RETENTION_BINLOG_S3_DIR = 'standard_retention'
 BINLOG_LOCK_FILE = '/tmp/archive_mysql_binlogs.lock'
 BINLOG_INFINITE_REPEATER_TERM_FILE = '/tmp/archive_mysql_binlogs_infinite.die'
@@ -117,7 +118,8 @@ def already_uploaded(instance, binlog, logged_uploads):
 
     # we should hit this code rarely, only when uploads have not been logged
     boto_conn = boto.connect_s3()
-    bucket = boto_conn.get_bucket(environment_specific.S3_BINLOG_BUCKET, validate=False)
+    bucket = boto_conn.get_bucket(environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
+                                  validate=False)
     if bucket.get_key(s3_binlog_path(instance, os.path.basename((binlog)))):
         log.debug("Binlog already uploaded but not logged {b}".format(b=binlog))
         log_binlog_upload(instance, binlog)
@@ -135,8 +137,10 @@ def upload_binlog(instance, binlog, dry_run):
     dry_run - if set, do not actually upload a binlog
     """
     s3_upload_path = s3_binlog_path(instance, binlog)
-    log.info('Local file {local_file} will uploaded to {s3_upload_path}'
+    bucket = environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()]
+    log.info('Local file {local_file} will uploaded to s3://{buk}/{s3_upload_path}'
              ''.format(local_file=binlog,
+                       buk=bucket,
                        s3_upload_path=s3_upload_path))
 
     if dry_run:
@@ -149,44 +153,13 @@ def upload_binlog(instance, binlog, dry_run):
                                          stdout=subprocess.PIPE)
         safe_uploader.safe_upload(precursor_procs=procs,
                                   stdin=procs['lzop'].stdout,
-                                  bucket=environment_specific.S3_BINLOG_BUCKET,
+                                  bucket=bucket,
                                   key=s3_upload_path)
     except:
         log.debug('In exception handling for failed binlog upload')
         safe_uploader.kill_precursor_procs(procs)
         raise
     log_binlog_upload(instance, binlog)
-
-
-def check_upload_procs(procs, term_path):
-    """ Watch process and throw exceptions in case of failures
-
-    Args:
-    procs - An array of processes
-    term_path - Path to touch to kill repater.
-
-    Returns:
-    True if all process have finished successfully,
-    False if some are still running.
-    """
-    success = True
-    # explicitly order the for loop
-    for proc in ['lzop', 'repeater', 'upload']:
-        if (proc == 'repeater' and
-                success and not os.path.exists(term_path)):
-            log.debug('creating term file {term_path}'
-                      ''.format(proc_id=multiprocessing.current_process().name,
-                                term_path=term_path))
-            open(term_path, 'w').close()
-
-        ret = procs[proc].poll()
-        if ret is None:
-            success = False
-        elif ret != 0:
-            raise Exception('{proc} encountered an error'
-                            ''.format(proc=proc))
-
-    return success
 
 
 def log_binlog_upload(instance, binlog):
@@ -282,7 +255,8 @@ def s3_binlog_path(instance, binlog):
     """
     # At some point in the near future we will probably use reduced
     # retention for pinlater
-    return os.path.join(STANDARD_RETENTION_BINLOG_S3_DIR,
+    return os.path.join(BINLOG_S3_BASE_DIR,
+                        STANDARD_RETENTION_BINLOG_S3_DIR,
                         instance.replica_type,
                         instance.hostname,
                         str(instance.port),

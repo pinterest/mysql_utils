@@ -39,6 +39,10 @@ CSV_BACKUP_LOCK_TABLE = """CREATE TABLE IF NOT EXISTS {db}.{tbl} (
   INDEX `expires` (`expires`)
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1"""
 MAX_THREAD_ERROR = 5
+LOCKS_HELD_TIME = '5 MINUTE'
+# How long locks are held and updated
+LOCK_EXTEND_FREQUENCY = 10
+# LOCK_EXTEND_FREQUENCY in seconds
 
 PATH_PITR_DATA = 'pitr/{replica_set}/{db_name}/{date}'
 SUCCESS_ENTRY = 'YAY_IT_WORKED'
@@ -179,19 +183,27 @@ class mysql_backup_csv:
         conn - a connection the the mysql instance
         pitr_data - data describing the position of the db data in replication
         """
-        # attempt to take lock by writing a lock to the master
         proc_id = multiprocessing.current_process().name
+        if not self.force_reupload and self.already_backed_up(db):
+            log.info('{proc_id}: {db} is already backed up, skipping'
+                     ''.format(proc_id=proc_id,
+                               db=db))
+            return
+
+        # attempt to take lock by writing a lock to the master
         tmp_dir_db = None
         lock_identifier = None
+        extend_lock_thread = None
         try:
+            self.release_expired_locks()
             lock_identifier = self.take_backup_lock(db)
+            extend_lock_stop_event = threading.Event()
+            extend_lock_thread = threading.Thread(target=self.extend_backup_lock,
+                                                  args=(lock_identifier,
+                                                        extend_lock_stop_event))
+            extend_lock_thread.daemon = True
+            extend_lock_thread.start()
             if not lock_identifier:
-                return
-
-            if not self.force_reupload and self.already_backed_up(db):
-                log.info('{proc_id}: {db} is already backed up, skipping'
-                         ''.format(proc_id=proc_id,
-                                   db=db))
                 return
 
             log.info('{proc_id}: {db} db backup start'
@@ -212,6 +224,12 @@ class mysql_backup_csv:
                      ''.format(db=db,
                                proc_id=proc_id))
         finally:
+            if extend_lock_thread:
+                extend_lock_stop_event.set()
+                log.debug('{proc_id}: {db} waiting for lock expiry thread to'
+                          'end'.format(db=db,
+                                       proc_id=proc_id))
+                extend_lock_thread.join()
             if lock_identifier:
                 log.debug('{proc_id}: {db} releasing lock'
                           ''.format(db=db,
@@ -282,7 +300,6 @@ class mysql_backup_csv:
                 self.cleanup_fifo(fifo)
 
             safe_uploader.kill_precursor_procs(procs)
-
             raise
 
     def create_fifo(self, fifo):
@@ -422,7 +439,7 @@ class mysql_backup_csv:
         a uuid lock identifier
         """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = zk.get_replica_set_from_instance(self.instance)
+        (replica_set, _) = self.instance.get_zk_replica_set()
         master = zk.get_mysql_instance_from_replica_set(replica_set,
                                                         host_utils.REPLICA_ROLE_MASTER)
         master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
@@ -441,13 +458,14 @@ class mysql_backup_csv:
                "lock_identifier = %(lock)s, "
                "lock_active = 'active', "
                "created_at = NOW(), "
-               "expires = NOW() + INTERVAL 1 HOUR, "
+               "expires = NOW() + INTERVAL {locks_held_time}, "
                "released = NULL, "
                "db = %(db)s,"
                "hostname = %(hostname)s,"
                "port = %(port)s"
                "").format(db=mysql_lib.METADATA_DB,
-                          tbl=CSV_BACKUP_LOCK_TABLE_NAME)
+                          tbl=CSV_BACKUP_LOCK_TABLE_NAME,
+                          locks_held_time=LOCKS_HELD_TIME)
         cursor = master_conn.cursor()
         try:
             cursor.execute(sql, params)
@@ -474,6 +492,38 @@ class mysql_backup_csv:
         log.debug(cursor._executed)
         return lock_identifier
 
+    def extend_backup_lock(self, lock_identifier, extend_lock_stop_event):
+        """ Extend a backup lock. This is to be used by a thread
+
+        Args:
+        lock_identifier - Corrosponds to a lock identifier row in the
+                          CSV_BACKUP_LOCK_TABLE_NAME.
+        extend_lock_stop_event - An event that will be used to inform this
+                                 thread to stop extending the lock
+        """
+        # Assumption is that this is callled right after creating the lock
+        last_update = time.time()
+        while(not extend_lock_stop_event.is_set()):
+            if (time.time() - last_update) > LOCK_EXTEND_FREQUENCY:
+                zk = host_utils.MysqlZookeeper()
+                (replica_set, _) = self.instance.get_zk_replica_set()
+                master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
+                master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+                cursor = master_conn.cursor()
+
+                params = {'lock_identifier': lock_identifier}
+                sql = ('UPDATE {db}.{tbl} '
+                       'SET expires = NOW() + INTERVAL {locks_held_time} '
+                       'WHERE lock_identifier = %(lock_identifier)s'
+                       '').format(db=mysql_lib.METADATA_DB,
+                                  tbl=CSV_BACKUP_LOCK_TABLE_NAME,
+                                  locks_held_time=LOCKS_HELD_TIME)
+                cursor.execute(sql, params)
+                master_conn.commit()
+                log.debug(cursor._executed)
+                last_update = time.time()
+            extend_lock_stop_event.wait(.5)
+
     def release_db_backup_lock(self, lock_identifier):
         """ Release a backup lock created by take_backup_lock
 
@@ -481,7 +531,7 @@ class mysql_backup_csv:
         lock_identifier - a uuid to identify a lock row
         """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = zk.get_replica_set_from_instance(self.instance)
+        (replica_set, _) = self.instance.get_zk_replica_set()
         master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
         master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
         cursor = master_conn.cursor()
@@ -497,12 +547,12 @@ class mysql_backup_csv:
         log.debug(cursor._executed)
 
     def ensure_backup_locks_sanity(self):
-        """ Release any backup locks that aren't valid. This means either expired
-            or created by the same host as the caller. The instance level flock
+        """ Release any backup locks that aren't sane. This means locks
+            created by the same host as the caller. The instance level flock
             should allow this assumption to be correct.
         """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = zk.get_replica_set_from_instance(self.instance)
+        (replica_set, _) = self.instance.get_zk_replica_set()
         master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
         master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
         cursor = master_conn.cursor()
@@ -523,6 +573,14 @@ class mysql_backup_csv:
                           tbl=CSV_BACKUP_LOCK_TABLE_NAME)
         cursor.execute(sql, params)
         master_conn.commit()
+
+    def release_expired_locks(self):
+        """ Release any expired locks """
+        zk = host_utils.MysqlZookeeper()
+        (replica_set, _) = self.instance.get_zk_replica_set()
+        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        cursor = master_conn.cursor()
 
         sql = ('UPDATE {db}.{tbl} '
                'SET lock_active = NULL AND released = NOW() '

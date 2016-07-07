@@ -37,14 +37,14 @@ def rotate_binlogs_if_needed(port, dry_run):
     age = (datetime.datetime.utcnow() - creation).seconds
     if age > MAX_AGE:
         log.info('Age of current binlog is {age} which is greater than '
-                 ' MAX_AGE ({MAX_AGE})'.format(age=age,
+                 'MAX_AGE ({MAX_AGE})'.format(age=age,
                                                MAX_AGE=MAX_AGE))
         if not dry_run:
             log.info('Flushing bin log')
             mysql_lib.flush_master_log(instance)
     else:
         log.info('Age of current binlog is {age} which is less than '
-                 ' MAX_AGE ({MAX_AGE})'.format(age=age,
+                 'MAX_AGE ({MAX_AGE})'.format(age=age,
                                                MAX_AGE=MAX_AGE))
 
 

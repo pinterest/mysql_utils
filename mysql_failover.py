@@ -137,7 +137,7 @@ def mysql_failover(master, dry_run, skip_lock,
         if dry_run:
             log.info('In dry_run mode, so exiting now')
             # Using os._exit in order to not get catch in the giant try
-            os._exit(0)
+            os._exit(environment_specific.DRY_RUN_EXIT_CODE)
 
         log.info('Preliminary sanity checks complete, starting promotion')
 

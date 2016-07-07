@@ -77,20 +77,15 @@ def main():
                         choices=environment_specific.SUPPORTED_MYSQL_MINOR_VERSIONS,
                         # default is set in the underlying function
                         default=None)
-    parser.add_argument('--override_classic_security',
-                        help=('Do not replace with an instance in the same '
-                              'security group, instead use the supplied '
-                              'security group in AWS CLASSIC.'),
-                        default=None)
     parser.add_argument('--override_vpc_security',
                         help=('Do not replace with an instance in the same '
                               'security group, instead use the supplied '
                               'security group in AWS VPC.'),
+                        choices=environment_specific.VPC_SECURITY_GROUPS.keys(),
                         default=None)
 
     args = parser.parse_args()
     overrides = {'availability_zone': args.override_az,
-                 'classic_security_group': args.override_classic_security,
                  'hostname': args.override_hostname,
                  'instance_type': args.override_hw,
                  'mysql_major_version': args.override_mysql_major_version,
@@ -120,8 +115,7 @@ def launch_replacement_db_host(original_server,
                         automation won't put it into prod use.
     overrides - A dict of overrides. Availible keys are
                 'mysql_minor_version', 'hostname', 'vpc_security_group',
-                'availability_zone', 'classic_security_group',
-                'instance_type', and 'mysql_major_version'.
+                'availability_zone', 'instance_type', and 'mysql_major_version'.
     reason - A description of why the host is being replaced. If the instance
              is still accessible and reason is not supply an exception will be
              thrown.
@@ -167,6 +161,24 @@ def launch_replacement_db_host(original_server,
                                                  timeout=SERVER_BUILD_TIMEOUT))
                 replace_again = True
 
+    # Check to see if MySQL is up on the host
+    try:
+        # This is not multi instance compatible. If we move to multiple
+        # instances this will need to be updated
+        conn = mysql_lib.connect_mysql(original_server)
+        conn.close()
+        dead_server = False
+        version_server = original_server
+    except MySQLdb.OperationalError as detail:
+        dead_server = True
+        (error_code, msg) = detail.args
+        if error_code != mysql_lib.MYSQL_ERROR_CONN_HOST_ERROR:
+            raise
+        log.info('MySQL is down, assuming hardware failure')
+        reasons.add('hardware failure')
+        version_server = zk.get_mysql_instance_from_replica_set(original_server.get_zk_replica_set()[0],
+                                                                repl_type=host_utils.REPLICA_ROLE_MASTER)
+
     # Pull some information from cmdb.
     cmdb_data = environment_specific.get_server_metadata(original_server.hostname)
     if not cmdb_data:
@@ -178,30 +190,17 @@ def launch_replacement_db_host(original_server,
 
     log.info('Data from cmdb: {cmdb_data}'.format(cmdb_data=cmdb_data))
     replacement_config = {'availability_zone': cmdb_data['location'],
+                          'vpc_security_group': cmdb_data['security_groups'],
                           'hostname': find_unused_server_name(original_server.get_standardized_replica_set(),
                                                               reporting_conn, dry_run),
                           'instance_type': cmdb_data['config.instance_type'],
-                          'mysql_major_version': get_master_mysql_major_version(original_server),
+                          'mysql_major_version': mysql_lib.get_global_variables(version_server)['version'][0:3],
                           'mysql_minor_version': DEFAULT_MYSQL_MINOR_VERSION,
                           'dry_run': dry_run,
                           'skip_name_check': True}
 
-    if cmdb_data.pop('cloud.aws.vpc_id', None):
-        # Existing server is in VPC
-        replacement_config['classic_security_group'] = None
-        replacement_config['vpc_security_group'] = cmdb_data['security_groups']
-    else:
-        # Existing server is in Classic
-        replacement_config['classic_security_group'] = cmdb_data['security_groups']
-        replacement_config['vpc_security_group'] = None
-
     # At this point, all our defaults should be good to go
     config_overridden = False
-    if replacement_config['classic_security_group'] and overrides['vpc_security_group']:
-        # a VPC migration
-        vpc_migration(replacement_config, overrides)
-        reasons.add('vpc migration')
-        config_overridden = True
 
     # All other overrides
     for key in overrides.keys():
@@ -227,21 +226,6 @@ def launch_replacement_db_host(original_server,
     if config_overridden:
         log.info('Configuration after overrides: {replacement_config}'
                  ''.format(replacement_config=replacement_config))
-
-    # Check to see if MySQL is up on the host
-    try:
-        # This is not multi instance compatible. If we move to multiple
-        # instances this will need to be updated
-        conn = mysql_lib.connect_mysql(original_server)
-        conn.close()
-        dead_server = False
-    except MySQLdb.OperationalError as detail:
-        dead_server = True
-        (error_code, msg) = detail.args
-        if error_code != mysql_lib.MYSQL_ERROR_CONN_HOST_ERROR:
-            raise
-        log.info('MySQL is down, assuming hardware failure')
-        reasons.add('hardware failure')
 
     if not dead_server:
         try:
@@ -435,53 +419,6 @@ def log_replacement_host(reporting_conn, original_server_data, new_instance_id,
     except _mysql_exceptions.IntegrityError:
         raise Exception('A replacement has already been requested')
     reporting_conn.commit()
-
-
-def get_master_mysql_major_version(instance):
-    """ Given an instance, determine the mysql major version for the master
-        of the replica set.
-
-    Args:
-    instance - a hostaddr object
-
-    Returns - A string similar to '5.5' or '5.6'
-   """
-    zk = host_utils.MysqlZookeeper()
-    master = zk.get_mysql_instance_from_replica_set(instance.get_zk_replica_set()[0],
-                                                    repl_type=host_utils.REPLICA_ROLE_MASTER)
-    try:
-        mysql_version = mysql_lib.get_global_variables(master)['version'][:3]
-    except _mysql_exceptions.OperationalError:
-        raise Exception('Could not connect to master server {instance} in '
-                        'order to determine MySQL version to launch with. '
-                        'Perhaps run this script from there? This is likely '
-                        'due to firewall rules.'
-                        ''.format(instance=instance.hostname))
-    return mysql_version
-
-
-def vpc_migration(replacement_config, overrides):
-    """ Figure out if a replacement is valid, and then update the
-        replacement_config as needed
-
-    Args:
-    replacement_config - A dict of the default configuration for launching
-                         a new server
-    overrides - A dict of overrides for the default configuration
-    """
-    if overrides['vpc_security_group'] in \
-            environment_specific.VPC_MIGRATION_MAP[replacement_config['classic_security_group']]:
-        log.info('VPC migration: {classic} -> {vpc_sg}'.format(classic=replacement_config['classic_security_group'],
-                                                               vpc_sg=overrides['vpc_security_group']))
-        replacement_config['vpc_security_group'] = overrides['vpc_security_group']
-        overrides['vpc_security_group'] = None
-        replacement_config['classic_security_group'] = None
-    else:
-        raise Exception('VPC security group {vpc_sg} is not a valid replacement '
-                        'for classic security group {classic_sg}. Valid options are:'
-                        '{options}'.format(vpc_sg=overrides['vpc_security_group'],
-                                           classic_sg=replacement_config['classic_security_group'],
-                                           options=environment_specific.VPC_MIGRATION_MAP[replacement_config['classic_security_group']]))
 
 
 if __name__ == "__main__":

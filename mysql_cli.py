@@ -8,13 +8,13 @@ import subprocess
 from lib import host_utils
 from lib import mysql_lib
 
-MYSQL_CLI = ('/usr/bin/mysql -A -h {host} -P {port} '
+MYSQL_CLI = ('/usr/bin/mysql -A -h {host} -P {port} {sql_safe} '
              '--user={user} --password={password} '
              '--prompt="\h:\p \d \u> " {db}')
 
 # if we just want to run a command and disconnect, no
 # point in setting a prompt.
-MYSQL_CLI_EX = ('/usr/bin/mysql -A -h {host} -P {port} '
+MYSQL_CLI_EX = ('/usr/bin/mysql -A -h {host} -P {port} {sql_safe} '
                 '--user={user} --password={password} '
                 '{db} -e "{execute}"')
 
@@ -97,6 +97,38 @@ def main():
     (username, password) = mysql_lib.get_mysql_user_for_role(
         environment_specific.CLI_ROLES[args.privileges][role_modifier])
 
+    # we may or may not know what replica set we're connecting to at
+    # this point.
+    sql_safe = ''
+    try:
+        replica_set, _ = zk.get_replica_set_from_instance(host)
+    except Exception as e:
+        if 'is not in zk' in e.message:
+            log.warning('SERVER IS NOT IN ZK!!!')
+            replica_set = None
+        else:
+            raise
+
+    try:
+        # do we need a prompt?
+        if replica_set in environment_specific.EXTRA_PARANOID_REPLICA_SETS:
+            if args.privileges in ['read-write', 'admin']:
+                resp = raw_input("You've asked for {priv} access to replica "
+                                 "set {rs}.  Are you sure? (Y/N): ".format(
+                                    priv=args.privileges,
+                                    rs=replica_set))
+                if not resp or resp[0] not in ['Y', 'y']:
+                    raise Exception('Connection aborted by user!')
+
+        # should we enable safe-updates?
+        if replica_set in environment_specific.PARANOID_REPLICA_SETS:
+            if args.privileges in ['read-write', 'admin']:
+                sql_safe = '--init-command="SET SESSION SQL_SAFE_UPDATES=ON"'
+
+    except Exception as e:
+        log.error("Unable to continue: {}".format(e))
+        return
+
     if args.execute:
         execute_escaped = string.replace(args.execute, '"', '\\"')
         cmd = MYSQL_CLI_EX.format(host=host.hostname,
@@ -104,13 +136,15 @@ def main():
                                   db=db,
                                   user=username,
                                   password=password,
+                                  sql_safe=sql_safe,
                                   execute=execute_escaped)
     else:
         cmd = MYSQL_CLI.format(host=host.hostname,
                                port=host.port,
                                db=db,
                                user=username,
-                               password=password)
+                               password=password,
+                               sql_safe=sql_safe)
     log.info(cmd)
     proc = subprocess.Popen(cmd, shell=True)
     proc.wait()

@@ -1,10 +1,13 @@
 import ConfigParser
 import fcntl
 import json
+import multiprocessing
 import os
+import pycurl
 import re
 import shutil
 import socket
+import StringIO
 import subprocess
 import time
 import getpass
@@ -243,12 +246,19 @@ def restart_pt_daemons(port):
     Args:
     port - the of the mysql instance on localhost to act on
     """
+    restart_pt_heartbeat(port)
+    restart_pt_kill(port)
+
+
+def restart_pt_heartbeat(port):
     log.info('Restarting pt-heartbeat')
     cmd = PTHEARTBEAT_CMD.format(port=port, action='restart')
     log.info(cmd)
     (std_out, std_err, return_code) = shell_exec(cmd)
     log.info(std_out.rstrip())
 
+
+def restart_pt_kill(port):
     log.info('Restart pt-kill')
     cmd = PTKILL_CMD.format(port=port, action='restart')
     log.info(cmd)
@@ -706,6 +716,30 @@ def shell_exec(cmd):
     return (std_out, std_err, return_code)
 
 
+def check_dict_of_procs(proc_dict):
+    """ Check a dict of process for exit, error, etc...
+
+    Args:
+    A dict of processes
+
+    Returns: True if all processes have completed with return status 0
+             False is some processes are still running
+             An exception is generated if any processes have completed with a
+             returns status other than 0
+    """
+    success = True
+    for proc in proc_dict:
+        ret = proc_dict[proc].poll()
+        if ret is None:
+            # process has not yet terminated
+            success = False
+        elif ret != 0:
+            raise Exception('{proc_id}: {proc} encountered an error'
+                            ''.format(proc_id=multiprocessing.current_process().name,
+                                      proc=proc))
+    return success
+
+
 def get_cnf_setting(variable, port):
     """ Get the value of a variab from a mysql cnf
 
@@ -835,10 +869,26 @@ def get_instance_type():
     A string describing the hardware of the server
     """
 
-    (std_out, std_err, return_code) = shell_exec('facter ec2_instance_type')
+    (std_out, std_err, return_code) = shell_exec('ec2metadata --instance-type')
 
     if not std_out:
         raise Exception('Could not determine hardware, error:'
                         '{std_err}'.format(std_err=std_err))
 
     return std_out.strip()
+
+
+def get_iam_role():
+    """ Get the IAM role for the local server
+
+    Returns: The IAM role of the local server
+    """
+    buf = StringIO.StringIO()
+    c = pycurl.Curl()
+    c.setopt(c.URL, 'http://169.254.169.254/latest/meta-data/iam/info')
+    c.setopt(c.WRITEFUNCTION, buf.write)
+    c.perform()
+    c.close()
+
+    profile = json.loads(buf.getvalue())['InstanceProfileArn']
+    return profile[(1 + profile.index("/")):]

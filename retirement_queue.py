@@ -230,7 +230,7 @@ def terminate_instances(hostname=None, dry_run=False):
     zk = host_utils.MysqlZookeeper()
     username, password = mysql_lib.get_mysql_user_for_role('admin')
     terminate_instances = get_retirement_queue_servers(TERMINATE_INSTANCE)
-    conn = boto.ec2.connect_to_region('us-east-1')
+    botoconn = boto.ec2.connect_to_region('us-east-1')
 
     if hostname:
         if hostname in terminate_instances:
@@ -275,7 +275,7 @@ def terminate_instances(hostname=None, dry_run=False):
         if dry_run:
             log.info('In dry_run mode, not changing state')
         else:
-            conn.terminate_instances(instance_ids=[terminate_instances[hostname]['instance_id']])
+            botoconn.terminate_instances(instance_ids=[terminate_instances[hostname]['instance_id']])
             log_to_retirement_queue(hostname,
                                     terminate_instances[hostname]['instance_id'],
                                     TERMINATE_INSTANCE)

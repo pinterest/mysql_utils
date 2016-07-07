@@ -1,5 +1,14 @@
 # Pinterest MySQL Management Tools
 
+## NOTE: THESE TOOLS WILL NOT WORK JUST WORK!!!
+You will need to add a fair amount of glue in order to make these tools work:
+  - **Service discovery**
+  - **A CMDB**
+  - **A bunch of company specific information in the environment specifics lib**
+
+It is hoped that this code will be useful to you as an example of working
+implementations of DB tools.
+
 ## Basics of MySQL at Pinterest
 
 Pinterest has historically used MySQL to store some of our most important data:
@@ -44,10 +53,10 @@ datacenter migrations, there are optional arguments.
 
 After the new server has booted and received its initial base configuration
 from our provisioning system, a cron job will notice that the data directory is
-empty and run mysql_restore_xtrabackup.py. Based on service discovery, this 
+empty and run mysql_restore.py. Based on service discovery, this 
 script will attempt to find a database backup, restore it, setup replication,
 and then add the new MySQL instance to service discovery.  Like 
-launch_replacement_db_host.py,  mysql_restore_xtrabackup.py accepts many 
+launch_replacement_db_host.py,  mysql_restore.py accepts many 
 optional arguments for non-standard uses.
 
 If a MySQL master server requires replacement, the mysql_failover.py script
@@ -74,6 +83,8 @@ A list of included utilities:
 This script backs up MySQL replication logs in order to be able to perform
 point-in-time recoveries in the case where all servers in a replica set are
 lost. All logs up to the current log being written to are uploaded to S3.
+  - **backup_tester.py**
+Replace some number of replica servers in order to test backups.
   - **binlog_rotator.py**
 If the current binlog has been in use longer than a predefined limit, rotate
 it.
@@ -152,14 +163,16 @@ This script provides an interface to check and correct db user configuration.
   - **mysql_init_server.py**
 This script takes a server with mysql binaries installed and sets up an empty
 mysql instance and then imports users.
+  - **mysql_record_table_size.py*
+Record the size of all innodb tables.
   - **mysql_replica_mappings.py**
 This script provides administrators a quick view of what is in production in a
 format that is easy to use for shell scripting. The script can also pull in
 hardware, availability zone, etc...
-  - **mysql_restore_logical.py**
-This script finds a logical backup, restores it, sets up replication.
-  - **mysql_restore_xtrabackup.py**
-This script finds a xtrabackup backup, restores it, sets up replication and
+  - **restart_daemons.py**
+Restart pt daemons, if needed.
+  - **mysql_restore.py**
+This script finds a backup, restores it, sets up replication and
 then adds the new instance to service discovery based on data recorded by
 launch_replacement_db_host.py.
   - **mysql_shard_status.py**

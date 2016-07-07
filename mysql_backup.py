@@ -20,17 +20,21 @@ def main():
                         '--backup_type',
                         help='Type of backup to run.',
                         default=backup.BACKUP_TYPE_XBSTREAM,
-                        choices=backup.BACKUP_TYPES)
+                        choices=(backup.BACKUP_TYPE_LOGICAL,
+                                 backup.BACKUP_TYPE_XBSTREAM))
     args = parser.parse_args()
     instance = host_utils.HostAddr(':'.join((host_utils.HOSTNAME, args.port)))
     mysql_backup(instance, args.backup_type)
 
 
-def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM):
+def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM, initial_build=False):
     """ Run a file based backup on a supplied local instance
 
     Args:
     instance - A hostaddr object
+    backup_type - backup.BACKUP_TYPE_LOGICAL or backup.BACKUP_TYPE_XBSTREAM
+    initial_build - Boolean, if this is being created right after the server
+                    was built
     """
     log.info('Confirming sanity of replication (if applicable)')
     zk = host_utils.MysqlZookeeper()
@@ -57,9 +61,9 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM):
         # Actually run the backup
         log.info('Running backup')
         if backup_type == backup.BACKUP_TYPE_XBSTREAM:
-            backup_file = backup.xtrabackup_instance(instance, start_timestamp)
+            backup_file = backup.xtrabackup_instance(instance, start_timestamp, initial_build)
         elif backup_type == backup.BACKUP_TYPE_LOGICAL:
-            backup_file = backup.logical_backup_instance(instance, start_timestamp)
+            backup_file = backup.logical_backup_instance(instance, start_timestamp, initial_build)
         else:
             raise Exception('Unsupported backup type {backup_type}'
                             ''.format(backup_type=backup_type))

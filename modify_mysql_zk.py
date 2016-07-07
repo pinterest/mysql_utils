@@ -20,7 +20,7 @@ def main():
                         help=("What modification to make. If 'auto', the host "
                               "replacement log will be used to determine what "
                               "what role to use. Default is auto."),
-                        choices=['add_slave', 'add_dr_slave', 'auto',
+                        choices=['add_slave', 'add_dr_slave',
                                  'swap_master_and_slave',
                                  'swap_slave_and_dr_slave'],
                         default='auto')
@@ -59,27 +59,22 @@ def main():
                             '--dangerous flag was not supplied.')
     elif action == 'swap_slave_and_dr_slave':
         swap_slave_and_dr_slave(instance, args.dry_run)
-    elif action == 'auto':
-        auto_add_instance_to_zk(instance, args.dry_run)
     else:
         raise Exception('Invalid action: {action}'.format(action=action))
 
 
-def auto_add_instance_to_zk(instance, dry_run):
+def auto_add_instance_to_zk(port, dry_run):
     """ Try to do right thing in adding a server to zk
 
     Args:
-    instance - The replacement instance
+    port - The port of replacement instance on localhost
     dry_run - If set, do not modify zk
     """
+    instance = host_utils.HostAddr(':'.join([host_utils.HOSTNAME, str(port)]))
     try:
         conn = mysql_lib.get_mysqlops_connections()
-        log.info('Determining replacement for '
-                 '{hostname}'.format(hostname=instance.hostname))
-        server_metadata = environment_specific.get_server_metadata(instance.hostname)
-        if not server_metadata:
-            raise Exception('CMDB lacks knowledge of replacement host')
-        instance_id = server_metadata['id']
+        log.info('Determining replacement for port {}'.format(port))
+        instance_id = host_utils.get_local_instance_id()
         role = determine_replacement_role(conn, instance_id)
         log.info('Adding server as role: {role}'.format(role=role))
     except Exception, e:

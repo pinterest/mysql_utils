@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import argparse
-import multiprocessing
 import os
 import psutil
 import subprocess
@@ -10,6 +9,7 @@ import time
 import urllib
 
 from lib import environment_specific
+from lib import host_utils
 
 ATTEMPTS = 5
 BLOCK = 262144
@@ -108,66 +108,56 @@ def safe_upload(precursor_procs, stdin, bucket, key,
                  procs in precursor_procs have finished.
     check_args - The arguments to supply to the check_func
     """
+    upload_procs = dict()
     devnull = open(os.devnull, 'w')
     try:
         term_path = get_term_file()
-        repeater = subprocess.Popen([get_exec_path(), term_path],
-                                    stdin=stdin,
-                                    stdout=subprocess.PIPE)
-        uploader = subprocess.Popen([S3_SCRIPT, 'put',
-                                     '-k', urllib.quote_plus(key),
-                                     '-b', bucket],
-                                    stdin=repeater.stdout,
-                                    stderr=devnull)
-        success = False
-        while not success:
-            success = True
-            for proc in precursor_procs:
-                ret = precursor_procs[proc].poll()
-                if ret is None:
-                    # process has not yet terminated
-                    success = False
-                elif ret != 0:
-                    raise Exception('{proc_id}: {proc} encountered an error'
-                                    ''.format(proc_id=multiprocessing.current_process().name,
-                                              proc=proc))
+        upload_procs['repeater'] = subprocess.Popen(
+                                       [get_exec_path(), term_path],
+                                       stdin=stdin,
+                                       stdout=subprocess.PIPE)
+        upload_procs['uploader'] = subprocess.Popen(
+                                       [S3_SCRIPT, 'put',
+                                        '-k', urllib.quote_plus(key),
+                                        '-b', bucket],
+                                       stdin=upload_procs['repeater'].stdout,
+                                       stderr=devnull)
 
-            # if we have success up to here, *and the term path does not exist* we
-            # should run the check function and create the term_path.
-            if success:
-                if not check_term_file(term_path):
-                    if check_func:
-                        check_func(check_arg)
-                    with open(term_path, 'w') as term_handle:
-                        term_handle.write(TERM_STRING)
+        # While the precursor procs are running, we need to make sure
+        # none of them have errors and also check that the upload procs
+        # also don't have errors.
+        while not host_utils.check_dict_of_procs(precursor_procs):
+            host_utils.check_dict_of_procs(upload_procs)
+            time.sleep(SLEEP_TIME)
 
-            # After checking the precursor_procs, next check the repeater
-            ret = repeater.poll()
-            if ret is None:
-                success = False
-            elif ret != 0:
-                raise Exception('{proc_id}: repeater encountered an error'
-                                ''.format(proc_id=multiprocessing.current_process().name))
+        # Once the precursor procs have exited successfully, we will run
+        # any defined check function
+        if check_func:
+            check_func(check_arg)
 
-            # Finally, check the uploader.
-            ret = uploader.poll()
-            if ret is None:
-                success = False
-            elif ret != 0:
-                raise Exception('{proc_id}: uploader encountered an error'
-                                ''.format(proc_id=multiprocessing.current_process().name))
+        # And then create the term file which will cause the repeater and
+        # uploader to exit
+        with open(term_path, 'w') as term_handle:
+            term_handle.write(TERM_STRING)
 
-            if not success:
-                time.sleep(SLEEP_TIME)
+        # And finally we will wait for the uploader procs to exit without error
+        while not host_utils.check_dict_of_procs(upload_procs):
+            time.sleep(SLEEP_TIME)
     except:
-        if uploader and psutil.pid_exists(uploader.pid):
+        # So there has been some sort of a problem. We want to make sure that
+        # we kill the uploader so that under no circumstances the upload is
+        # successfull with bad data
+        if 'uploader' in upload_procs and\
+                psutil.pid_exists(upload_procs['uploader'].pid):
             try:
-                uploader.kill()
+                upload_procs['uploader'].kill()
             except:
                 pass
-        if repeater and psutil.pid_exists(repeater.pid):
+
+        if 'repeater' in upload_procs and\
+                psutil.pid_exists(upload_procs['repeater'].pid):
             try:
-                repeater.kill()
+                upload_procs['repeater'].kill()
             except:
                 pass
         raise

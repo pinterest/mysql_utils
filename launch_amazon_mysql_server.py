@@ -19,12 +19,8 @@ def main():
                         choices=sorted(environment_specific.SUPPORTED_HARDWARE,
                                        reverse=True),
                         required=True)
-    parser.add_argument('--classic_security_group',
-                        default=None,
-                        help='Used for launching in "classic", used instead of --vpc_security_group')
     parser.add_argument('--vpc_security_group',
                         default=None,
-                        help='Used for launching in "vpc", used instead of --classic_security_group',
                         choices=environment_specific.VPC_SECURITY_GROUPS.keys())
     parser.add_argument('--availability_zone',
                         choices=environment_specific.SUPPORTED_AZ,
@@ -48,14 +44,13 @@ def main():
     launch_amazon_mysql_server(hostname=args.hostname,
                                instance_type=args.instance_type,
                                vpc_security_group=args.vpc_security_group,
-                               classic_security_group=args.classic_security_group,
                                availability_zone=args.availability_zone,
                                mysql_major_version=args.mysql_major_version,
                                mysql_minor_version=args.mysql_minor_version,
                                dry_run=args.dry_run)
 
 
-def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group, classic_security_group,
+def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
                                availability_zone, mysql_major_version, mysql_minor_version,
                                dry_run, skip_name_check=False):
     """ Launch a mysql server in aws
@@ -63,9 +58,7 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group, clas
     Args:
     hostname - hostname of new server
     instance_type - hardware type
-    vpc_security_group - VPC firewall rules. This or classic_security_group
-                         must be supplied, but not both.
-    classic_security_group - AWS classic firewall rules. See vpc_security_group
+    vpc_security_group - VPC firewall rules.
     availability_zone - AWS availability zone
     mysql_major_version - MySQL major version. Example 5.5 or 5.6
     mysql_minor_version - Which "branch" to use. Values are 'stable', 'staging'
@@ -88,31 +81,17 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group, clas
               'image_id': environment_specific.SUPPORTED_HARDWARE[instance_type]['ami'],
               'instance_type': instance_type}
 
-    if vpc_security_group and not classic_security_group:
-        (subnet_name, config['subnet_id']) = \
-            get_subnet_from_sg(vpc_security_group, availability_zone)
-        ssh_security = environment_specific.SSH_SECURITY_MAP[subnet_name]['ssh']
-        config['instance_profile_name'] = environment_specific.SSH_SECURITY_MAP[subnet_name]['iam']
-        config['security_group_ids'] = [environment_specific.VPC_SECURITY_GROUPS[vpc_security_group]]
-    elif classic_security_group and not vpc_security_group:
-        config['security_groups'] = [classic_security_group]
-        if classic_security_group in environment_specific.CLASSIC_SECURE_SG:
-            ssh_security = environment_specific.SSH_SECURITY_SECURE
-        else:
-            ssh_security = environment_specific.SSH_SECURITY_DEV
-        config['instance_profile_name'] = environment_specific.INSTANCE_PROFILE_NAME
-    else:
-        raise Exception('One and only one of vpc_security_group and '
-                        'classic_security_group must be specified. Received:\n'
-                        'vpc_security_group: {vpc}, \n'
-                        'classic_security_group: {classic_security_group}'
-                        ''.format(vpc=vpc_security_group,
-                                  classic_security_group=classic_security_group))
+    (subnet_name, config['subnet_id']) = get_subnet_from_sg(vpc_security_group,
+                                                            availability_zone)
+    ssh_security = environment_specific.SSH_SECURITY_MAP[subnet_name]['ssh']
+    config['instance_profile_name'] = environment_specific.SSH_SECURITY_MAP[subnet_name]['iam']
+    config['security_group_ids'] = [environment_specific.VPC_SECURITY_GROUPS[vpc_security_group]]
 
     hiera_config = environment_specific.HIERA_FORMAT.format(
         ssh_security=ssh_security,
         mysql_major_version=mysql_major_version.replace('.', ''),
         mysql_minor_version=mysql_minor_version)
+
     if hiera_config not in environment_specific.SUPPORTED_HIERA_CONFIGS:
         raise Exception('Hiera config {hiera_config} is not supported.'
                         'Supported configs are: {supported}'

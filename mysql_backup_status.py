@@ -50,10 +50,11 @@ def find_mysql_backup(replica_set, date, backup_type):
                 if backup_file:
                     return backup_file
                 break
-            except:
-                # we'll get a 404 if there was no s3 backup, but that's OK,
-                # so we can just move on to the next one.
-                pass
+            except boto.exception.S3ResponseError:
+                raise
+            except Exception as e:
+                if backup.NO_BACKUP not in e[0]:
+                    raise
     return None
 
 

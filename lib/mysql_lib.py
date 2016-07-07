@@ -55,6 +55,7 @@ REPLICATION_TOLERANCE_NONE = 'None'
 REPLICATION_TOLERANCE_NORMAL = 'Normal'
 REPLICATION_TOLERANCE_LOOSE = 'Loose'
 
+
 class ReplicationError(Exception):
     pass
 
@@ -274,6 +275,7 @@ def flush_master_log(instance):
     cursor = conn.cursor()
     cursor.execute("FLUSH BINARY LOGS")
 
+
 def get_master_status(instance):
     """ Get poisition of most recent write to master replication logs
 
@@ -340,13 +342,13 @@ def get_binlog_archiving_lag(instance):
     """
     conn = connect_mysql(instance)
     cursor = conn.cursor()
-    sql  = ("SELECT binlog_creation "
-            "FROM {db}.{tbl} "
-            "WHERE hostname= %(hostname)s  AND "
-            "      port = %(port)s "
-            "ORDER BY binlog_creation DESC "
-            "LIMIT 1;").format(db=METADATA_DB,
-                               tbl=environment_specific.BINLOG_ARCHIVING_TABLE_NAME)
+    sql = ("SELECT binlog_creation "
+           "FROM {db}.{tbl} "
+           "WHERE hostname= %(hostname)s  AND "
+           "      port = %(port)s "
+           "ORDER BY binlog_creation DESC "
+           "LIMIT 1;").format(db=METADATA_DB,
+                              tbl=environment_specific.BINLOG_ARCHIVING_TABLE_NAME)
     params = {'hostname': instance.hostname,
               'port': instance.port}
     cursor.execute(sql, params)
@@ -1072,10 +1074,10 @@ def assert_replication_unlagged(instance, lag_tolerance, dead_master=False):
                                    r=instance))
     elif lag_tolerance == REPLICATION_TOLERANCE_LOOSE:
         if replication['sbm'] > LOOSE_HEARTBEAT_LAG:
-            problems.addi('Replica {r} has heartbeat lag {sbm} > {sbm_limit} seconds'
-                          ''.format(sbm=replication['sbm'],
-                                    sbm_limit=LOOSE_HEARTBEAT_LAG,
-                                    r=instance))
+            problems.add('Replica {r} has heartbeat lag {sbm} > {sbm_limit} seconds'
+                         ''.format(sbm=replication['sbm'],
+                                   sbm_limit=LOOSE_HEARTBEAT_LAG,
+                                   r=instance))
     else:
         problems.add('Unkown lag_tolerance mode: {m}'.format(m=lag_tolerance))
 
@@ -1114,7 +1116,7 @@ def assert_replication_sanity(instance,
         actual_master = host_utils.HostAddr(':'.join((slave_status['Master_Host'],
                                                       str(slave_status['Master_Port']))))
         if expected_master != actual_master:
-            problems.add('Master is {actual} rather than expected {expected}'
+            problems.add('Master is {actual} rather than expected {expected} '
                          'for replica {r}'.format(actual=actual_master,
                                                   expected=expected_master,
                                                   r=instance))
@@ -1507,3 +1509,93 @@ def get_installed_mysqld_version():
         raise Exception('Could not determine installed mysql version: '
                         '{std_err}')
     return re.search('.+Ver ([0-9.-]+)', std_out).groups()[0]
+
+
+def get_autoincrement_type(instance, db, table):
+    """ Get type of autoincrement field
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+    table - the name of the table to fetch columns
+
+    Returns:
+        str: autoincrement column type
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    param = {'db': db,
+             'table': table}
+
+    # Get the max value of the autoincrement field
+    type_query = ("SELECT COLUMN_TYPE "
+                  "FROM INFORMATION_SCHEMA.columns "
+                  "WHERE TABLE_NAME=%(table)s AND "
+                  "      TABLE_SCHEMA=%(db)s AND "
+                  "      EXTRA LIKE '%%auto_increment%%';")
+    cursor.execute(type_query, param)
+    ai_type = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if ai_type and 'COLUMN_TYPE' in ai_type:
+        return ai_type['COLUMN_TYPE']
+
+    return None
+
+
+def get_autoincrement_value(instance, db, table):
+    """ Get the current value of the autoincrement field
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+    table - the name of the table to fetch columns
+
+    Returns:
+        long: next value of the autoincrement field
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    param = {'db': db,
+             'table': table}
+
+    # Get the size of the autoincrement field
+    value_query = ("SELECT AUTO_INCREMENT "
+                   "FROM INFORMATION_SCHEMA.TABLES "
+                   "WHERE TABLE_NAME=%(table)s AND "
+                   "      TABLE_SCHEMA=%(db)s;")
+    cursor.execute(value_query, param)
+    ai_value = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if ai_value and 'AUTO_INCREMENT' in ai_value:
+        return ai_value['AUTO_INCREMENT']
+    return None
+
+
+def get_autoincrement_info_by_db(instance, db):
+    """ Gets the current values of the autoincrement fields on a db basis
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+
+    Returns:
+        (dict of str: tuple):
+            table_name:(autoincrement size,
+                        the most recent value of the autoincrement field)
+    """
+
+    tables = get_tables(instance, db)
+    ret = {}
+    for table in tables:
+        ai_val = get_autoincrement_value(instance, db, table)
+        ai_type = get_autoincrement_type(instance, db, table)
+        ret[table] = (ai_type, ai_val)
+    return ret

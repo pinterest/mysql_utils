@@ -119,6 +119,9 @@ class mysql_backup_csv:
             log.info('Will temporarily dump inside of {path}'
                      ''.format(path=self.dump_base_path))
 
+            log.info('Releasing any old expired locks')
+            self.purge_old_expired_locks()
+
             log.info('Releasing any invalid shard backup locks')
             self.ensure_backup_locks_sanity()
 
@@ -452,11 +455,12 @@ class mysql_backup_csv:
         params = {'lock': lock_identifier,
                   'db': db,
                   'hostname': self.instance.hostname,
-                  'port': self.instance.port}
+                  'port': self.instance.port,
+                  'active': ACTIVE}
         sql = ("INSERT INTO {db}.{tbl} "
                "SET "
                "lock_identifier = %(lock)s, "
-               "lock_active = 'active', "
+               "lock_active = %(active)s, "
                "created_at = NOW(), "
                "expires = NOW() + INTERVAL {locks_held_time}, "
                "released = NULL, "
@@ -538,8 +542,9 @@ class mysql_backup_csv:
 
         params = {'lock_identifier': lock_identifier}
         sql = ('UPDATE {db}.{tbl} '
-               'SET lock_active = NULL AND released = NOW() '
-               'WHERE lock_identifier = %(lock_identifier)s'
+               'SET lock_active = NULL, released = NOW() '
+               'WHERE lock_identifier = %(lock_identifier)s AND '
+               '      lock_active is NOT NULL'
                '').format(db=mysql_lib.METADATA_DB,
                           tbl=CSV_BACKUP_LOCK_TABLE_NAME)
         cursor.execute(sql, params)
@@ -583,8 +588,25 @@ class mysql_backup_csv:
         cursor = master_conn.cursor()
 
         sql = ('UPDATE {db}.{tbl} '
-               'SET lock_active = NULL AND released = NOW() '
+               'SET lock_active = NULL, released = NOW() '
                'WHERE expires < NOW()'
+               '').format(db=mysql_lib.METADATA_DB,
+                          tbl=CSV_BACKUP_LOCK_TABLE_NAME)
+        cursor.execute(sql)
+        master_conn.commit()
+        log.debug(cursor._executed)
+
+    def purge_old_expired_locks(self):
+        """ Delete any locks older than a week """
+        zk = host_utils.MysqlZookeeper()
+        (replica_set, _) = self.instance.get_zk_replica_set()
+        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        cursor = master_conn.cursor()
+
+        sql = ('DELETE FROM {db}.{tbl} '
+               'WHERE expires < NOW() - INTERVAL 1 WEEK AND '
+               '        lock_active is NOT NULL '
                '').format(db=mysql_lib.METADATA_DB,
                           tbl=CSV_BACKUP_LOCK_TABLE_NAME)
         cursor.execute(sql)

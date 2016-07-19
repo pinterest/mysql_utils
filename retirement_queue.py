@@ -450,10 +450,10 @@ def get_retirement_queue_servers(next_state, recent=False):
                         '"{next_state}"'.format(next_state=next_state))
 
     if recent:
-        when = "    AND happened > now() - INTERVAL 1 DAY "
+        when = "    AND happened > now() - INTERVAL 18 HOUR "
     else:
         when = ("    AND happened > now() - INTERVAL 3 WEEK "
-                "    AND happened < now() - INTERVAL 1 DAY ")
+                "    AND happened < now() - INTERVAL 18 HOUR ")
     reporting_conn = mysql_lib.get_mysqlops_connections()
     cursor = reporting_conn.cursor()
     sql = ("SELECT t1.hostname, t1.instance_id, t1.happened "

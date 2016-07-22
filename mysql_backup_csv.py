@@ -66,18 +66,24 @@ def main():
                         default='INFO',
                         help='Change logging verbosity',
                         choices=set(['INFO', 'DEBUG']))
+    parser.add_argument('--dev_bucket',
+                        default=False,
+                        action='store_true',
+                        help='Use the dev bucket, useful for testing')
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None))
     # If we ever want to run multi instance, this wil need to be updated
     backup_obj = mysql_backup_csv(host_utils.HostAddr(host_utils.HOSTNAME),
-                                  args.db, args.force_table, args.force_reupload)
+                                  args.db, args.force_table,
+                                  args.force_reupload, args.dev_bucket)
     backup_obj.backup_instance()
 
 
 class mysql_backup_csv:
 
     def __init__(self, instance,
-                 db=None, force_table=None, force_reupload=False):
+                 db=None, force_table=None,
+                 force_reupload=False, dev_bucket=False):
         """ Init function for backup, takes all args
 
         Args:
@@ -99,6 +105,10 @@ class mysql_backup_csv:
 
         self.force_table = force_table
         self.force_reupload = force_reupload
+        if dev_bucket:
+            self.upload_bucket = environment_specific.S3_CSV_BUCKET_DEV
+        else:
+            self.upload_bucket = environment_specific.S3_CSV_BUCKET
 
     def backup_instance(self):
         """ Back up a replica instance to s3 in csv """
@@ -119,11 +129,11 @@ class mysql_backup_csv:
             log.info('Will temporarily dump inside of {path}'
                      ''.format(path=self.dump_base_path))
 
-            log.info('Releasing any old expired locks')
-            self.purge_old_expired_locks()
-
             log.info('Releasing any invalid shard backup locks')
             self.ensure_backup_locks_sanity()
+
+            log.info('Deleting old expired locks')
+            self.purge_old_expired_locks()
 
             log.info('Stopping replication SQL thread to get a snapshot')
             mysql_lib.stop_replication(self.instance, mysql_lib.REPLICATION_THREAD_SQL)
@@ -286,7 +296,7 @@ class mysql_backup_csv:
             # And run the upload
             safe_uploader.safe_upload(precursor_procs=procs,
                                       stdin=procs['lzop'].stdout,
-                                      bucket=environment_specific.S3_CSV_BUCKET,
+                                      bucket=self.upload_bucket,
                                       key=data_path,
                                       check_func=self.check_dump_success,
                                       check_arg=return_value)
@@ -407,7 +417,7 @@ class mysql_backup_csv:
                             proc_id=multiprocessing.current_process().name,
                             db=db))
         boto_conn = boto.connect_s3()
-        bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
+        bucket = boto_conn.get_bucket(self.upload_bucket, validate=False)
         key = bucket.new_key(s3_path)
         key.set_contents_from_string(json.dumps(pitr_data))
 
@@ -428,7 +438,7 @@ class mysql_backup_csv:
                   ''.format(schema_path=schema_path,
                             proc_id=multiprocessing.current_process().name))
         boto_conn = boto.connect_s3()
-        bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
+        bucket = boto_conn.get_bucket(self.upload_bucket, validate=False)
         key = bucket.new_key(schema_path)
         key.set_contents_from_string(create_stm)
 
@@ -571,7 +581,7 @@ class mysql_backup_csv:
         params = {'hostname': self.instance.hostname,
                   'port': self.instance.port}
         sql = ('UPDATE {db}.{tbl} '
-               'SET lock_active = NULL AND released = NOW() '
+               'SET lock_active = NULL, released = NOW() '
                'WHERE hostname = %(hostname)s AND '
                '     port = %(port)s'
                '').format(db=mysql_lib.METADATA_DB,
@@ -623,7 +633,7 @@ class mysql_backup_csv:
         bool - True if the db has already been backed up, False otherwise
         """
         boto_conn = boto.connect_s3()
-        bucket = boto_conn.get_bucket(environment_specific.S3_CSV_BUCKET, validate=False)
+        bucket = boto_conn.get_bucket(self.upload_bucket, validate=False)
         for table in self.get_tables_to_backup(db):
             (_, data_path, _) = environment_specific.get_csv_backup_paths(
                                            self.datestamp, db, table,

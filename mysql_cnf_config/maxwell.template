@@ -1,0 +1,41 @@
+log_level=info
+
+host={master_host}
+port={master_port}
+user={username}
+password={password}
+
+replication_host={instance_host}
+replication_port={instance_port}
+replication_user={username}
+replication_password={password}
+
+client_id={client_id}
+
+schema_database=test
+
+producer={output}
+output_file=/dev/null
+binlog_connector=true
+
+kafka_topic_generator={generator}
+kafka.bootstrap.servers={kafka_servers}
+kafka_topic={kafka_topic}
+kafka.retries=5
+kafka.max.in.flight.requests.per.connection=1
+zen_service_name={zen_service}
+
+output_binlog_position=true
+output_gtid_position={gtid_mode}
+gtid_mode={gtid_mode}
+exclude_dbs={excludes}
+
+# Maxwell collects metrics via dropwizard. These can be exposed through the
+# base logging mechanism (slf4j), JMX or HTTP.
+# Options: [jmx, slf4j, http]
+# Supplying multiple is allowed.
+metrics_reporting_type=jmx
+# When metrics_reporting_type includes slf4j this is the frequency metrics are emitted to the log, in seconds
+metrics_reporting_interval=60
+# When metrics_reporting_type includes http this is the port the server will bind to.
+metrics_reporting_port=8080

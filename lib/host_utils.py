@@ -34,7 +34,7 @@ MYSQL_GEN_ZK = '/var/config/config.services.general_mysql_databases_config'
 MYSQL_SHARD_MAP_ZK = '/var/config/config.services.generaldb.mysql_shards'
 MYSQL_SHARD_MAP_ZK_TEST = \
     "/var/config/config.services.generaldb.test_mysql_shards"
-MYSQL_MAX_WAIT = 120
+MYSQL_MAX_WAIT = 300
 MYSQL_STARTED = 0
 MYSQL_STOPPED = 1
 MYSQL_SUPERVISOR_PROC = 'mysqld-3306'
@@ -53,7 +53,9 @@ REQUIRED_MOUNTS = ['/raid0:/mnt']
 SUPERVISOR_CMD = '/usr/local/bin/supervisorctl {action} mysql:mysqld-{port}'
 INIT_CMD = '/etc/init.d/mysqld_multi {options} {action} {port}'
 PTKILL_CMD = '/usr/sbin/service pt-kill-{port} {action}'
+KILL_CHECKSUM_CMD= 'ssh root@{} " ps -ef | grep mysql_checksu[m]  | awk \'{{print \$2}}\' | xargs kill -9 "'
 PTHEARTBEAT_CMD = '/usr/sbin/service pt-heartbeat-{port} {action}'
+MAXWELL_CMD = '/usr/sbin/service maxwell-{port} {action}'
 # Tcollector will restart automatically
 RESTART_TCOLLECTOR = '/usr/bin/pkill -f "/opt/tcollector/"'
 ZK_CACHE = [MYSQL_DS_ZK, MYSQL_DR_ZK, MYSQL_GEN_ZK]
@@ -267,11 +269,33 @@ def restart_pt_kill(port):
     log.info(std_out.rstrip())
 
 
+def restart_maxwell(port):
+    log.info('Restart Maxwell')
+    cmd = MAXWELL_CMD.format(port=port, action='restart')
+    log.info(cmd)
+    (stdout, stderr, return_code) = shell_exec(cmd)
+    if stdout.rstrip(): 
+        log.info(stdout.rstrip())
+
+
 def restart_tcollector():
     log.info('Restart tcollector')
     log.info(RESTART_TCOLLECTOR)
     shell_exec(RESTART_TCOLLECTOR)
 
+
+def kill_checksum(instance):
+    log.info("Killing the checksum ")
+    cmd = KILL_CHECKSUM_CMD.format(instance.hostname)
+    log.info(cmd)
+    (std_out, std_err, return_code) = shell_exec(cmd)
+    if return_code != 0:
+        log.info("Checksum didn't get killed.")
+        log.info(std_err)
+    else:
+        log.warning("Checksum got killed !")
+    return return_code
+        
 
 def upgrade_auth_tables(port):
     """ Run mysql_upgrade
@@ -474,6 +498,22 @@ class MysqlZookeeper:
         shard_map = self.get_zk_mysql_shard_map()
         shard_data = shard_map['services'][s]['namespaces'][ns]['shards']['0']
         return (shard_data['replica_set'], shard_data['mysqldb'])
+    
+    def get_replica_sets_by_shard_type(self, shard_type):
+        """ Get all replica sets for a given shard type.
+        Args:
+        shard_type - A shard type
+        Returns:
+                A tuple of a replica set name
+        """
+        (s, ns) = self.map_shard_type_to_service_and_namespace(shard_type)
+        shard_map = self.get_zk_mysql_shard_map()
+        shard_data = shard_map['services'][s]['namespaces'][ns]['shards']
+        replica_set = set()
+        for shard in shard_data.values():
+            replica_set.add(shard['replica_set'])
+            
+        return replica_set
 
     def get_zk_mysql_shard_map(self, use_test=False):
         """ Load the ZK-based shard-to-server mapping data.

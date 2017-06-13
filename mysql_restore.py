@@ -148,10 +148,6 @@ def restore_instance(backup_type, restore_source, destination,
                         skip_backup=True,
                         lock_handle=lock_handle)
 
-        # make sure that super_read_only is disabled.
-        mysql_lib.set_global_variable(destination, 'super_read_only',
-                                      False, True)
-
         if backup_type == backup.BACKUP_TYPE_XBSTREAM:
             xbstream_restore(backup_key, destination.port)
             if master == restore_source:
@@ -199,11 +195,6 @@ def restore_instance(backup_type, restore_source, destination,
             destination.port,
             options=host_utils.DEFAULTS_FILE_EXTRA_ARG.format(
                 defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
-
-        # we have to do this again here, too, since we just did
-        # a restart.
-        mysql_lib.set_global_variable(destination, 'super_read_only',
-                                      False, True)
 
         # Since we haven't started the slave yet, make sure we've got these
         # plugins installed, whether we use them or not.
@@ -461,10 +452,6 @@ def logical_restore(dump, destination):
                                host_utils.DEFAULTS_FILE_ARG.format(
                                 defaults_file=host_utils.MYSQL_UPGRADE_CNF_FILE))
         rate_limit = None
-
-    # make sure that super_read_only is disabled, or we won't be
-    # able to load the data.
-    mysql_lib.set_global_variable(destination, 'super_read_only', False, True)
 
     log.info('Downloading, decompressing and importing backup')
     procs = dict()

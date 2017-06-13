@@ -304,6 +304,26 @@ def get_master_status(instance):
     return master_status
 
 
+def get_gtid_subtract(instance, src_gtid_set, ref_gtid_set):
+    """ Get poisition of most recent write to master replication logs
+
+    Args:
+    instance - a hostAddr object
+    s_gtid_set: set of source gtid
+    ref_gtid_set: set of reference gtid
+
+    Returns:
+    'bba7d5dd-fdfe-11e6-8b1e-12005f9b2b06:877821-877864'
+
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    cursor.execute("SELECT GTID_SUBTRACT('{source}','{ref}') as "
+                   "errant_trx".format(source=src_gtid_set, ref=ref_gtid_set))
+    gtid_subtract = cursor.fetchone()
+    return gtid_subtract['errant_trx']
+
+
 def get_master_logs(instance):
     """ Get MySQL binary log names and size
 
@@ -534,6 +554,10 @@ def setup_audit_plugin(instance):
         Args:
         instance - A hostaddr object
     """
+    return 
+    # this is intentional; we may re-enable the audit log at some 
+    # later date, but for now, we just exit.
+
     conn = connect_mysql(instance)
     cursor = conn.cursor()
 
@@ -1115,9 +1139,17 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
         # Replication reporting is wonky for the first second
         time.sleep(1)
         # Avoid race conditions for zk update monitor
-        assert_replication_sanity(slave_hostaddr,
+        # if we are all in Gtid's mode then we check both IO and SQL threads
+        # after START SLAVE
+        if gtid_auto_pos:
+            assert_replication_sanity(slave_hostaddr,
                                   set([CHECK_SQL_THREAD, CHECK_IO_THREAD]))
-
+        else:
+            # But with gtid_migration set on where OLD master host not in
+            # gtid mode yet we just don't check IO thread yet
+            # Expecting IO thread will brake after failover before msyql get
+            # restarted
+            assert_replication_sanity(slave_hostaddr, set([CHECK_SQL_THREAD]))
 
 def find_errant_trx(source, reference):
     """ If this is a GTID cluster, determine if this slave has any errant
@@ -1128,34 +1160,19 @@ def find_errant_trx(source, reference):
             reference: the instance to compare to.  it may be a master,
                        or it may be another slave in the same cluster.
         Returns:
-            A list of errant trx, or None if there aren't any.
+            A string of errant trx, or None if there aren't any.
     """
-    ss = get_master_status(source)
-    errant_trx = list()
-
-    if ss.get('Executed_Gtid_Set'):
-        source_gtid_dict = {y.split(':')[0]: ':'.join(y.split(':')[1:])
-                            for y in [x.strip()
-                            for x in ss['Executed_Gtid_Set'].split(',')]}
-
-        rs = get_master_status(reference)
-        ref_gtid_dict = {y.split(':')[0]: ':'.join(y.split(':')[1:])
-                         for y in [x.strip()
-                         for x in rs['Executed_Gtid_Set'].split(',')]}
-
-        source_uuid_set = set(source_gtid_dict.keys())
-        ref_uuid_set = set(ref_gtid_dict.keys())
-
-        for server_id in source_uuid_set - ref_uuid_set:
-            errant_trx.append('{}:{}'.format(server_id,
-                                             source_gtid_dict[server_id]))
+    ss = get_master_status(source).get('Executed_Gtid_Set').replace('\n', '')
+    rs = get_master_status(reference).get('Executed_Gtid_Set').replace('\n', '')
+    errant_trx = get_gtid_subtract(source, ss, rs)
     return errant_trx
 
 
-def fix_errant_trx(gtid_list, target_instance, is_master=True):
+def fix_errant_trx(gtids, target_instance, is_master=True):
     """ We have a set of GTIDs that don't belong.  Try to fix them.
         Args:
-            gtid_list: A list of GTIDs
+            gtids: A String of GTIDs eg:
+            'bba7d5dd-fdfe-11e6-8b1e-12005f9b2b06:877821-877864, etc'
             target_instance: The hostaddr of the instance to use
             is_master: Is this a master?
         Returns:
@@ -1169,10 +1186,10 @@ def fix_errant_trx(gtid_list, target_instance, is_master=True):
         cursor.execute('SET SESSION sql_log_bin=0')
 
     sql = 'SET GTID_NEXT=%(gtid)s'
-
     # AFAIK, there is no 'bulk' way to do this.
-    for gtid in gtid_list:
-        (uuid, trx_list) = gtid.split(':', 1)
+    for gtid in gtids.split(','):
+        #something we need to remove like '\nfa93a365-1307-11e7-944a-1204915fd524:1'
+        (uuid, trx_list) = gtid.strip().split(':', 1)
         for trx in trx_list.split(':'):
             try:
                 # it's a range.
@@ -1210,12 +1227,12 @@ def wait_for_catch_up(slave_hostaddr, io=False, migration=False):
     get_slave_status(slave_hostaddr)
 
     try:
-        assert_replication_sanity(slave_hostaddr, migration)
+        assert_replication_sanity(slave_hostaddr, migration=migration)
     except:
         log.warning('Replication does not appear sane, going to sleep 60 '
                     'seconds in case things get better on their own.')
         time.sleep(60)
-        assert_replication_sanity(slave_hostaddr, migration)
+        assert_replication_sanity(slave_hostaddr, migration=migration)
 
     invalid_lag = ('{} is unavailable, going to sleep for a minute and '
                    'retry. A likely reason is that there was a failover '
@@ -1323,8 +1340,8 @@ def assert_replication_unlagged(instance, lag_tolerance, dead_master=False):
 
 
 def assert_replication_sanity(instance,
-                              migration=False,
-                              checks=ALL_REPLICATION_CHECKS):
+                              checks=ALL_REPLICATION_CHECKS,
+                              migration=False):
     """ Confirm that a replica has replication running and from the correct
         source if the replica is in zk. If not, throw an exception.
 
@@ -1409,12 +1426,22 @@ def calc_slave_lag(slave_hostaddr, dead_master=False):
             raise
 
     ret['ss'] = ss
-    slave_sql_pos = ss['Exec_Master_Log_Pos']
-    slave_sql_binlog = ss['Relay_Master_Log_File']
-    _, slave_sql_binlog_num = re.split('\.', slave_sql_binlog)
-    slave_io_pos = ss['Read_Master_Log_Pos']
-    slave_io_binlog = ss['Master_Log_File']
-    _, slave_io_binlog_num = re.split('\.', slave_io_binlog)
+
+    # if this is a GTID+auto-position slave, and we're running
+    # this for the first time, we won't have values for this stuff.
+    # so we'll make something up just so we can get started.
+    if ss['Auto_Position'] and not ss['Relay_Master_Log_File']:
+        slave_sql_pos = 1
+        slave_io_pos = 1
+        slave_sql_binlog_num = '000001'
+        slave_io_binlog_num = '000001'
+    else:
+        slave_sql_pos = ss['Exec_Master_Log_Pos']
+        slave_sql_binlog = ss['Relay_Master_Log_File']
+        _, slave_sql_binlog_num = re.split('\.', slave_sql_binlog)
+        slave_io_pos = ss['Read_Master_Log_Pos']
+        slave_io_binlog = ss['Master_Log_File']
+        _, slave_io_binlog_num = re.split('\.', slave_io_binlog)
 
     master_hostaddr = host_utils.HostAddr(':'.join((ss['Master_Host'],
                                                     str(ss['Master_Port']))))
@@ -1552,11 +1579,13 @@ def set_global_variable(instance, variable, value, check_existence=False):
 
     # If we are enabling read only we need to kill all long running trx
     # so that they don't block the change
-    if (variable == 'read_only' or variable == 'super_read_only') and value:
-        if 'super_read_only' in gvars and gvars['super_read_only'] == 'ON':
+    if variable == 'read_only' and value:
+        if gvars[variable] == 'ON':
+            log.debug('read_only is already enabled.')
             # no use trying to set something that is already turned on
             return True
-        kill_long_trx(instance)
+        else:
+            kill_long_trx(instance)
 
     parameters = {'value': value}
     # Variable is not a string and can not be paramaretized as per normal

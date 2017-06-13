@@ -60,10 +60,8 @@ long_query_time = 0.1
 userstat = on
 log_warnings_suppress='1592'
 
-# audit log defaults
-loose_audit_log_format = JSON
+# because the audit log plugin eats disk
 loose_audit_log_policy = NONE
-loose_audit_log_file = __ROOT__/mysql/3306/logs/audit.log
 
 
 # Miscellaneous

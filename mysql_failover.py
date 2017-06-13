@@ -155,14 +155,10 @@ def mysql_failover(master, dry_run, skip_lock, ignore_dr_slave,
         log.info('Preliminary sanity checks complete, starting promotion')
 
         if master_conn:
-            # since the master is alive, we can check for these.
-            errant_trx = mysql_lib.find_errant_trx(slave, master)
-            if errant_trx:
-                log.warning('Errant transactions found!  Repairing via master.')
-                mysql_lib.fix_errant_trx(errant_trx, master, True)
-            else:
-                log.info('No errant transactions detected.')
-
+            log.info("We kill a checksum if it is running")
+            if not host_utils.kill_checksum(master):
+                log.info("Give it sometime to be gone")
+                time.sleep(2)
             log.info('Setting read_only on master')
             mysql_lib.set_global_variable(master, 'read_only', True)
             log.info('Confirming no writes to old master')
@@ -176,6 +172,16 @@ def mysql_failover(master, dry_run, skip_lock, ignore_dr_slave,
                                     dead_master,
                                     True,
                                     mysql_lib.NORMAL_HEARTBEAT_LAG)
+
+            # since the master is alive, we can check for these.
+            # and we want to wait until the replica is in sync.
+            errant_trx = mysql_lib.find_errant_trx(slave, master)
+            if errant_trx:
+                log.warning('Errant transactions found!  Repairing via master.')
+                mysql_lib.fix_errant_trx(errant_trx, master, True)
+            else:
+                log.info('No errant transactions detected.')
+
             log.info('Setting up replication from old master ({master}) '
                      'to new master ({slave})'.format(master=master,
                                                       slave=slave))
@@ -217,8 +223,6 @@ def mysql_failover(master, dry_run, skip_lock, ignore_dr_slave,
 
     if dr_slave:
         try:
-            log.info('Disabling super_read_only on the dr_slave')
-            mysql_lib.set_global_variable(dr_slave, 'super_read_only', False, True)
             mysql_lib.setup_replication(new_master=slave, new_replica=dr_slave,
                                         auto_pos=(not gtid_migrate))
             # anything on the slave that the dr_slave still doesn't have?
@@ -241,9 +245,6 @@ def mysql_failover(master, dry_run, skip_lock, ignore_dr_slave,
             log.error(e)
             log.error('Setting up replication on the dr_slave failed. '
                       'Failing forward!')
-
-        log.info('Enabling super_read_only on the dr_slave')
-        mysql_lib.set_global_variable(dr_slave, 'super_read_only', True, True)
 
 
     log.info('Updating zk')
@@ -270,10 +271,6 @@ def mysql_failover(master, dry_run, skip_lock, ignore_dr_slave,
         # updated with new zk config but the old master is dead
         # already we simply FORCE-fence it here
         fence_server.add_fence_to_host(master, dry_run, force=True)
-    else:
-        # enable super_read_only on the newly-demoted master.
-        log.info('Enabling super_read_only on old master.')
-        mysql_lib.set_global_variable(master, 'super_read_only', True, True)
 
     if lock_identifier:
         log.info('Releasing promotion lock')

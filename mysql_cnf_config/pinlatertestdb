@@ -3,3 +3,4 @@ innodb_flush_log_at_trx_commit = 2
 sync_binlog = 0
 slave_parallel_workers = 16
 innodb_thread_concurrency = 32
+max_binlog_files=500

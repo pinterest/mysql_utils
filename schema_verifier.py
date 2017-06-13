@@ -10,10 +10,13 @@ from lib import mysql_lib
 
 
 def main():
+    zk = host_utils.MysqlZookeeper()
+    all_sharded_systems = (list(zk.get_sharded_types()) +
+                           environment_specific.FLEXSHARD_DBS.keys())
     parser = argparse.ArgumentParser(description='MySQL schema verifier')
     parser.add_argument('instance_type',
                         help='Type of MySQL instance to verify',
-                        choices=environment_specific.SHARDED_DBS_PREFIX_MAP.keys())
+                        choices=all_sharded_systems)
     parser.add_argument('table',
                         help='Table to check',)
     parser.add_argument('seed_instance',
@@ -23,12 +26,11 @@ def main():
                         help=('Which db on --seed_instance from which to fetch'
                               ' a table definition. (ex pbdata012345)'))
     args = parser.parse_args()
-    zk_prefix = environment_specific.SHARDED_DBS_PREFIX_MAP[args.instance_type]['zk_prefix']
     seed_instance = host_utils.HostAddr(args.seed_instance)
     desired = mysql_lib.show_create_table(seed_instance, args.seed_db, args.table)
     tbl_hash = hashlib.md5(desired).hexdigest()
     print ("Desired table definition:\n{desired}").format(desired=desired)
-    incorrect = check_schema(zk_prefix, args.table, tbl_hash)
+    incorrect = check_schema(args.instance_type, args.table, tbl_hash)
     if len(incorrect) == 0:
         print "It appears that all schema is synced"
         sys.exit(0)
@@ -48,7 +50,7 @@ def main():
     sys.exit(1)
 
 
-def check_schema(zk_prefix, tablename, tbl_hash):
+def check_schema(instance_type, tablename, tbl_hash):
     """Verify that a table across an entire tier has the expected schema
 
     Args:
@@ -63,10 +65,8 @@ def check_schema(zk_prefix, tablename, tbl_hash):
     """
     incorrect = dict()
     zk = host_utils.MysqlZookeeper()
-    for replica_set in zk.get_all_mysql_replica_sets():
-        if not replica_set.startswith(zk_prefix):
-            continue
-
+    for replica_set in zk.get_replica_sets_by_shard_type(instance_type):
+        
         for role in host_utils.REPLICA_TYPES:
             instance = zk.get_mysql_instance_from_replica_set(replica_set, role)
             hashes = check_instance_table(instance, tablename, tbl_hash)

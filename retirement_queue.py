@@ -18,7 +18,7 @@ RESET_STATS = 'Reset statistics'
 SHUTDOWN_MYSQL = 'Shutdown MySQL'
 TERMINATE_INSTANCE = 'Terminate instance'
 IGNORABLE_USERS = set(["admin", "ptkill", "monit", "dbascript",
-                       "#mysql_system#", 'ptchecksum',
+                       "#mysql_system#", 'ptchecksum', 'maxwell',
                        "replicant", "root", "heartbeat", "system user"])
 
 OUTPUT_FORMAT = ('{hostname:<34} '

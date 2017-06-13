@@ -34,7 +34,10 @@ PT_KILL_TEMPLATE = 'pt_kill.template'
 PT_KILL_CONF_FILE = '/etc/pt-kill.conf'
 PT_KILL_IGNORE_USERS = ['admin', 'etl', 'longqueryro', 'longqueryrw',
                         'pbuser', 'mysqldump', 'xtrabackup', 'ptchecksum',
-                        'dbascript']
+                        'dbascript', 'maxwell']
+
+MAXWELL_TEMPLATE = 'maxwell.template'
+MAXWELL_CONF_FILE = '/etc/mysql/maxwell-3306.conf'
 
 REMOVE_SETTING_PREFIX = 'remove_'
 READ_ONLY_OFF = 'OFF'
@@ -48,7 +51,6 @@ UPGRADE_OVERRIDE_SETTINGS = {'skip_slave_start': None,
                              'innodb_fast_shutdown': '0'}
 UPGRADE_REMOVAL_SETTINGS = set(['enforce_storage_engine',
                                 'init_file',
-                                'super_read_only',
                                 'disabled_storage_engines'])
 
 
@@ -137,15 +139,8 @@ def build_cnf(host=None,
     log.info('Setting server_id to {}'.format(server_id))
     parser.set(MYSQLD_SECTION, 'server_id', server_id)
 
-    # Set read_only or super_read_only based upon service discovery
-    # if super_read_only is enabled, read_only is enabled by extension.
-    # if read_only is disabled, super_read_only is disabled by extension.
-    # note that we have to remember to disable SRO at various points during
-    # server initialization.
     ro_status = config_read_only(host)
     parser.set(MYSQLD_SECTION, 'read_only', ro_status)
-#    if major_version >= '5.6':
-#        parser.set(MYSQLD_SECTION, 'super_read_only', ro_status)
 
     # If needed, turn on safe updates via an init_file
     create_init_sql(host.hostname_prefix, parser, override_dir)
@@ -171,6 +166,10 @@ def build_cnf(host=None,
 
     # Create pt kill conf in order to kill long running queries
     create_pt_kill_conf(override_dir)
+
+    # We don't create the maxwell config file here; we let the
+    # daemon-restarter do it, because we need MySQL to be running
+    # to know some of the settings.
 
 
 def replace_config_tag(parser, tag, replace_value):
@@ -302,6 +301,50 @@ def create_log_rotate_conf(parser, override_dir=None):
     log.info('Writing log rotate config {path}'.format(path=log_rotate_conf_file))
     with open(log_rotate_conf_file, "w") as log_rotate_conf_file_handle:
         log_rotate_conf_file_handle.write(log_rotate_settings)
+
+
+def create_maxwell_config(client_id, instance, exclude_dbs=None, 
+                          target='kafka', gtid_mode='true'):
+    """ Create the maxwell config file.
+
+    Args:
+        client_id = The server_uuid
+        instance = What instance is this?
+        exclude_dbs = Exclude these databases (in addition to mysql and test)
+        target = Output to kafka or a file (which will be /dev/null)
+        gtid_mode = True if this is a GTID cluster, false otherwise
+    Returns:
+        Nothing
+    """
+    template_path = os.path.join(RELATIVE_DIR, MAXWELL_TEMPLATE)
+    with open(template_path, 'r') as f:
+        template = f.read()
+
+    (username, password) = mysql_lib.get_mysql_user_for_role('maxwell')
+    zk = host_utils.MysqlZookeeper()
+    replica_set = zk.get_replica_set_from_instance(instance)
+    master = zk.get_mysql_instance_from_replica_set(replica_set,
+                                                    host_utils.REPLICA_ROLE_MASTER)
+    log.info('Writing file {}'.format(MAXWELL_CONF_FILE))
+    excluded = ','.join(['mysql', 'test', exclude_dbs]) if exclude_dbs \
+                else 'mysql,test'
+
+    target_map = environment_specific.MAXWELL_TARGET_MAP[master.hostname_prefix]
+    with open(MAXWELL_CONF_FILE, "w") as f:
+        f.write(template.format(master_host=master.hostname,
+                                master_port=master.port,
+                                instance_host=instance.hostname,
+                                instance_port=instance.port,
+                                username=username,
+                                password=password,
+                                kafka_topic=target_map['kafka_topic'],
+                                kafka_servers=target_map['kafka_servers'],
+                                generator=target_map['generator'],
+                                zen_service=target_map['zen_service'],
+                                client_id=client_id,
+                                output=target,
+                                excludes=excluded,
+                                gtid_mode=gtid_mode))
 
 
 def create_mysql_cnf_files(parser, override_dir=None):

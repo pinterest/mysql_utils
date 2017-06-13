@@ -30,6 +30,22 @@ CSV_BACKUP_LOG_TABLE_DEFINITION = """CREATE TABLE IF NOT EXISTS {db}.{tbl} (
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1 """
 
 
+def is_sharded_but_not_sharded(replica_set):
+    """ We have a few systems which look like they're sharded but they
+        aren't - i.e., this means they are in the shard config but there
+        is only one of them, so we have to check them as if they were
+        unsharded.  There are only 3 of these.
+
+    Args:
+        replica_set: What replica set is this
+    Returns:
+        True or False - default is to False
+    """
+    if replica_set in ('interest', 'metadata', 'generalmysql001'):
+        return True
+    return False
+
+
 def find_mysql_backup(replica_set, date, backup_type):
     """ Check whether or not a given replica set has a logical or physical
         backup in S3
@@ -331,7 +347,8 @@ def verify_csv_instance_backup(instance, date, dev_bucket=False):
     zk = host_utils.MysqlZookeeper()
     replica_set = zk.get_replica_set_from_instance(instance)
     shards = zk.get_shards_by_replica_set()[replica_set]
-    if shards:
+
+    if shards and not is_sharded_but_not_sharded(replica_set):
         instance_shard_type_mapping = dict()
         missing_uploads = set()
         for shard in shards:

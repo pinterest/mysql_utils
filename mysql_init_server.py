@@ -105,9 +105,6 @@ def mysql_init_server(instance,
         log.info('Starting up instance')
         host_utils.start_mysql(instance.port)
 
-#        log.info('Disabling super_read_only if necessary')
-#        mysql_lib.set_global_variable(instance, 'super_read_only', False, True)
-
         log.info('Importing MySQL users')
         mysql_grants.manage_mysql_grants(instance, 'nuke_then_import')
 

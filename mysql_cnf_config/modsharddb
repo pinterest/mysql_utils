@@ -5,3 +5,4 @@ binlog_format = ROW
 gtid_mode = ON
 enforce_gtid_consistency = ON
 binlog_gtid_simple_recovery = 1
+slave_parallel_workers=16

@@ -55,17 +55,15 @@ def find_unused_db_servers():
     # First find out what servers we know about from zk, and make a
     # of hostname prefixes that we think we own.
     zk = host_utils.MysqlZookeeper()
-    config = zk.get_all_mysql_config()
+    config = zk.get_all_mysql_instances()
     zk_servers = set()
     zk_prefixes = set()
     mysql_aws_hosts = set()
     for db in config:
-        for rtype in host_utils.REPLICA_TYPES:
-            if rtype in config[db]:
-                host = config[db][rtype]['host']
-                zk_servers.add(host)
-                prefix = get_db_host_prefix(host)
-                zk_prefixes.add(prefix)
+        host = db.hostname
+        zk_servers.add(host)
+        prefix = get_db_host_prefix(host)
+        zk_prefixes.add(prefix)
 
     cmdb_servers = environment_specific.get_all_server_metadata()
     for host in cmdb_servers:

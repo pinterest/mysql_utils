@@ -8,7 +8,6 @@ from lib import host_utils
 from lib import mysql_lib
 from lib import environment_specific
 
-
 log = environment_specific.setup_logging_defaults(__name__)
 chat_handler = environment_specific.BufferingChatHandler()
 log.addHandler(chat_handler)
@@ -113,7 +112,7 @@ def determine_replacement_role(conn, instance_id):
     log.info('Host to be replaced is {old_host}'
              ''.format(old_host=old_host.hostname))
 
-    (_, repl_type) = zk.get_replica_set_from_instance(old_host)
+    repl_type = zk.get_replica_type_from_instance(old_host)
 
     if repl_type == host_utils.REPLICA_ROLE_MASTER:
         raise Exception('Corwardly refusing to replace a master!')
@@ -174,33 +173,40 @@ def add_replica_to_zk(instance, replica_type, dry_run):
     try:
         if replica_type not in [host_utils.REPLICA_ROLE_DR_SLAVE,
                                 host_utils.REPLICA_ROLE_SLAVE]:
-            raise Exception('Invalid value "{replica_type}" for argument '
-                            "replica_type").format(replica_type=replica_type)
+            raise Exception('Invalid value "{}" for argument '
+                            "replica_type").format(replica_type)
+
+        log.info('Instance is {}'.format(instance))
+        mysql_lib.assert_replication_sanity(instance)
+        mysql_lib.assert_replication_unlagged(
+            instance,
+            mysql_lib.REPLICATION_TOLERANCE_NORMAL)
+        master = mysql_lib.get_master_from_instance(instance)
 
         zk_local = host_utils.MysqlZookeeper()
         kazoo_client = environment_specific.get_kazoo_client()
         if not kazoo_client:
             raise Exception('Could not get a zk connection')
 
-        log.info('Instance is {inst}'.format(inst=instance))
-        mysql_lib.assert_replication_sanity(instance)
-        mysql_lib.assert_replication_unlagged(instance, mysql_lib.REPLICATION_TOLERANCE_NORMAL)
-        master = mysql_lib.get_master_from_instance(instance)
-        if master not in zk_local.get_all_mysql_instances_by_type(host_utils.REPLICA_ROLE_MASTER):
-            raise Exception('Instance {master} is not a master in zk'
-                            ''.format(master=master))
+        if master not in zk_local.get_all_mysql_instances_by_type(
+                    host_utils.REPLICA_ROLE_MASTER):
+            raise Exception('Instance {} is not a master in zk'
+                            ''.format(master))
 
         log.info('Detected master of {instance} '
                  'as {master}'.format(instance=instance,
                                       master=master))
 
-        (replica_set, _) = zk_local.get_replica_set_from_instance(master)
-        log.info('Detected replica_set as '
-                 '{replica_set}'.format(replica_set=replica_set))
+        replica_set = zk_local.get_replica_set_from_instance(master)
+        log.info('Detected replica_set as {}'.format(replica_set))
+        old_instance = zk_local.get_mysql_instance_from_replica_set(
+                           replica_set,
+                           repl_type=replica_type)
 
         if replica_type == host_utils.REPLICA_ROLE_SLAVE:
-            (zk_node, parsed_data, version) = get_zk_node_for_replica_set(kazoo_client,
-                                                                          replica_set)
+            (zk_node,
+             parsed_data, version) = get_zk_node_for_replica_set(kazoo_client,
+                                                                 replica_set)
             log.info('Replica set {replica_set} is held in zk_node '
                      '{zk_node}'.format(zk_node=zk_node,
                                         replica_set=replica_set))
@@ -247,10 +253,21 @@ def add_replica_to_zk(instance, replica_type, dry_run):
             else:
                 log.info('Pushing new dr configuration for '
                          '{replica_set}:'.format(replica_set=replica_set))
-                kazoo_client.set(environment_specific.DR_ZK, simplejson.dumps(new_data), dr_meta.version)
+                kazoo_client.set(environment_specific.DR_ZK,
+                                 simplejson.dumps(new_data), dr_meta.version)
         else:
             # we should raise an exception above rather than getting to here
             pass
+        if not dry_run:
+            log.info('Stopping replication and event scheduler on {} '
+                     'being taken out of use'.format(old_instance))
+            try:
+                mysql_lib.stop_replication(old_instance)
+                mysql_lib.stop_event_scheduler(old_instance)
+            except:
+                log.info('Could not stop replication on {}'
+                         ''.format(old_instance))
+
     except Exception, e:
         log.exception(e)
         raise
@@ -270,10 +287,11 @@ def swap_master_and_slave(instance, dry_run):
     if not kazoo_client:
         raise Exception('Could not get a zk connection')
 
-    log.info('Instance is {inst}'.format(inst=instance))
-    (replica_set, version) = zk_local.get_replica_set_from_instance(instance)
-    log.info('Detected replica_set as '
-             '{replica_set}'.format(replica_set=replica_set))
+    log.info('Instance is {}'.format(instance))
+
+    replica_set = zk_local.get_replica_set_from_instance(instance)
+    log.info('Detected replica_set as {}'.format(replica_set))
+
     (zk_node,
      parsed_data,
      version) = get_zk_node_for_replica_set(kazoo_client, replica_set)
@@ -314,10 +332,10 @@ def swap_slave_and_dr_slave(instance, dry_run):
     if not kazoo_client:
         raise Exception('Could not get a zk connection')
 
-    log.info('Instance is {inst}'.format(inst=instance))
-    (replica_set, _) = zk_local.get_replica_set_from_instance(instance)
-    log.info('Detected replica_set as '
-             '{replica_set}'.format(replica_set=replica_set))
+    log.info('Instance is {}'.format(instance))
+    replica_set = zk_local.get_replica_set_from_instance(instance)
+
+    log.info('Detected replica_set as {}'.format(replica_set))
     (zk_node,
      parsed_data,
      version) = get_zk_node_for_replica_set(kazoo_client, replica_set)
@@ -356,10 +374,12 @@ def swap_slave_and_dr_slave(instance, dry_run):
                  '{replica_set}:'.format(replica_set=replica_set))
         kazoo_client.set(zk_node, simplejson.dumps(new_data), version)
         try:
-            kazoo_client.set(environment_specific.DR_ZK, simplejson.dumps(new_dr_data), dr_meta.version)
+            kazoo_client.set(environment_specific.DR_ZK,
+                             simplejson.dumps(new_dr_data), dr_meta.version)
         except:
             raise Exception('DR node is incorrect due to a different change '
-                            'blocking this change. You need to fix it yourself')
+                            'blocking this change.  Manual intervention '
+                            'is required.')
 
 
 def update_host_replacement_log(conn, instance_id):

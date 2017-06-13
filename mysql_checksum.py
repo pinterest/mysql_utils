@@ -1,11 +1,13 @@
 #!/usr/bin/env python
+
 import argparse
-import time
+import logging
 import socket
 import sys
 import re
-from lib import environment_specific
+import time
 
+from lib import environment_specific
 from lib import host_utils
 from lib import mysql_lib
 
@@ -70,6 +72,7 @@ TABLE_DEF = ("CREATE TABLE IF NOT EXISTS {db}.{tbl} ( "
              "INDEX(reported_at),"
              "INDEX(checksum_status, reported_at) )")
 
+log = logging.getLogger(__name__)
 
 # create_checksum_detail_table
 #
@@ -81,7 +84,7 @@ def create_checksum_detail_table(instance):
     """
 
     try:
-        conn = mysql_lib.connect_mysql(instance, 'scriptrw')
+        conn = mysql_lib.connect_mysql(instance, 'dbascript')
         cursor = conn.cursor()
         cursor.execute(TABLE_DEF.format(db=mysql_lib.METADATA_DB, tbl=CHECKSUM_TBL))
         cursor.close()
@@ -142,7 +145,9 @@ def parse_sync_row(row):
             diff_count = int(delete_count) + int(replace_count) +\
                 int(insert_count) + int(update_count)
 
-        except ValueError, TypeError:
+        except ValueError:
+            pass
+        except TypeError:
             pass
 
     return diff_count
@@ -227,7 +232,8 @@ def main():
                             "yourself.")
 
     # Determine what replica set we belong to and get a list of slaves.
-    replica_set = zk.get_replica_set_from_instance(instance)[0]
+    replica_set = zk.get_replica_set_from_instance(instance)
+
     slaves = set()
     for rtype in host_utils.REPLICA_ROLE_SLAVE, host_utils.REPLICA_ROLE_DR_SLAVE:
         s = zk.get_mysql_instance_from_replica_set(replica_set, rtype)
@@ -236,7 +242,21 @@ def main():
 
     if len(slaves) == 0:
         log.info("This server has no slaves.  Nothing to do.")
-        sys.exit(0)
+        return
+
+    # in theory, we could allow multiple instances of this script to run
+    # on one server, as long as they are checksumming different replica sets.
+    # 
+    try:
+        lock = host_utils.bind_lock_socket('CHECKSUM_{}'.format(replica_set))
+    except socket.error, (code, msg):
+        log.error("Unable to bind socket for checksum on {rs} "
+                  "(msg: {m}, code:{c})".format(rs=replica_set,
+                                                m=msg, c=code))
+        sys.exit(code)
+
+    log.info("Locked replica set {} for checksum on this "
+             "server".format(replica_set))
 
     # before we even start this, make sure replication is OK.
     for slave in slaves:
@@ -322,7 +342,7 @@ def main():
                                 # some diffs, but not enough that we care.
                                 checksum_status = 'CHUNK_DIFFS_FOUND_BUT_OK'
                             else:
-                                start_time = int(time.time()*1000)
+                                start_time = int(time.time() * 1000)
                                 rows_checked = 'YES'
 
                                 # set the proper status - did we do a sync-based check
@@ -338,7 +358,7 @@ def main():
                                                                       tbl)
 
                                 # Add in the time it took to do the sync.
-                                elapsed_time_ms += int(time.time()*1000) - start_time
+                                elapsed_time_ms += int(time.time() * 1000) - start_time
 
                                 if not args.quiet:
                                     log.info("Sync command executed was:\n{cmd} ".format(cmd=sync_cmd))
@@ -381,6 +401,7 @@ def main():
                                          'sync_rc': sync_ret})
 
                         write_checksum_status(instance, data)
+    host_utils.release_lock_socket(lock)
 
 
 # write_checksum_status
@@ -394,7 +415,7 @@ def write_checksum_status(instance, data):
         Returns: Nothing
     """
     try:
-        conn = mysql_lib.connect_mysql(instance, 'scriptrw')
+        conn = mysql_lib.connect_mysql(instance, 'dbascript')
         cursor = conn.cursor()
         sql = ("INSERT INTO test.checksum_detail SET "
                "reported_at=NOW(), "
@@ -433,7 +454,7 @@ def check_one_replica(slave_instance, db, tbl):
     elapsed_time_ms = -1
 
     try:
-        conn = mysql_lib.connect_mysql(slave_instance, 'scriptro')
+        conn = mysql_lib.connect_mysql(slave_instance, 'dbascript')
         cursor = conn.cursor()
 
         # first, count the diffs
@@ -524,5 +545,5 @@ def checksum_tbl_via_sync(instance, db, tbl):
 
 
 if __name__ == "__main__":
-    log = environment_specific.setup_logging_defaults(__name__)
+    environment_specific.initialize_logger()
     main()

@@ -26,29 +26,49 @@ BACKUP_SEARCH_PREFIX = ('{backup_type}/{retention_policy}/{replica_set}/'
 BACKUP_SEARCH_INITIAL_PREFIX = ('{backup_type}/initial_build/'
                                 '{hostname}-{port}-{timestamp}')
 BACKUP_LOCK_FILE = '/tmp/backup_mysql.lock'
+BACKUP_LOCK_SOCKET = 'backupmysql'
 BACKUP_TYPE_LOGICAL = 'mysqldump'
 BACKUP_TYPE_LOGICAL_EXTENSION = 'sql.gz'
 BACKUP_TYPE_CSV = 'csv'
 BACKUP_TYPE_XBSTREAM = 'xtrabackup'
 BACKUP_TYPE_XBSTREAM_EXTENSION = 'xbstream'
+BACKUP_TYPE_PARTIAL_LOGICAL = 'mysqldump_partial'
 BACKUP_TYPES = set([BACKUP_TYPE_LOGICAL, BACKUP_TYPE_XBSTREAM,
                     BACKUP_TYPE_CSV])
 DEFAULT_MAX_RESTORE_AGE = 5
 INNOBACKUP_DECOMPRESS_THREADS = 8
 INNOBACKUPEX = '/usr/bin/innobackupex'
 INNOBACKUP_OK = 'completed OK!'
+LARGE_RESTORE_AGE = 90
 NO_BACKUP = 'Unable to find a valid backup for '
 MYSQLDUMP = '/usr/bin/mysqldump'
 MYSQLDUMP_CMD = ' '.join((MYSQLDUMP,
-                          '--master-data',
-                          '--single-transaction',
-                          '--events',
-                          '--all-databases',
-                          '--routines',
-                          '--user={dump_user}',
-                          '--password={dump_pass}',
-                          '--host={host}',
-                          '--port={port}'))
+                        '{arg_repl_coordinate}',
+                        '{arg_replace}',
+                        '--compact',
+                        '--single-transaction',
+                        '--net_buffer_length={net_buffer_length}',
+                        '--user={dump_user}',
+                        '--password={dump_pass}',
+                        '--host={host}',
+                        '--port={port}',
+                        '{arg_no_data}',
+                        '{db_args}'))
+MAX_INSERT_LENGTH = 50000
+MAX_TRANSFER_RATE = 100000
+INNODB_TO_BLACKHOLE = "sed -e 's/^) ENGINE=InnoDB/) ENGINE=Blackhole/'"
+REMOVE_AUTO_INC_COL_ARG = "sed -e 's/ AUTO_INCREMENT,/ DEFAULT 0,/g'"
+REMOVE_AUTO_INC_START_VALUE = "sed -e 's/ AUTO_INCREMENT\(=[0-9]\+\)\?//g'"
+REMOVE_INDEXES = "perl -0pe 's/,(\n +(PRIMARY|UNIQUE)? KEY[^\n]+)+//gs'"
+CREATE_IF_NOT_EXISTS_SED = "sed -e 's/CREATE TABLE/CREATE TABLE IF NOT EXISTS/g'"
+ARG_MASTER_DATA = '--master-data'
+ARG_SLAVE_DATA = '--dump-slave'
+ARG_ALL_DATABASES = ' '.join(('--all-databases',
+                              '--events',
+                              '--routines'))
+ARG_DATABASES = '--databases {dbs}'
+ARG_NO_DATA = '--no-data'
+ARG_REPLACE = '--replace'
 PIGZ = ['/usr/bin/pigz', '-p', '8']
 PV = ['/usr/bin/pv', '-peafbt']
 S3_SCRIPT = '/usr/local/bin/gof3r'
@@ -95,6 +115,10 @@ XTRABACKUP_CMD = ' '.join((INNOBACKUPEX,
                            '{datadir}'))
 MINIMUM_VALID_BACKUP_SIZE_BYTES = 1024 * 1024
 
+# Really, not everything needs a backup.
+XTRABACKUP_SKIP_FILE = '/etc/mysql/no_backup_xtrabackup'
+CSV_BACKUP_SKIP_FILE = '/etc/mysql/no_backup_csv'
+
 log = environment_specific.setup_logging_defaults(__name__)
 
 
@@ -112,12 +136,19 @@ def create_backup_file_name(instance, timestamp, initial_build, backup_type):
     A string of the path to the finished backup
     """
     timestamp_formatted = time.strftime('%Y-%m-%d-%H:%M:%S', timestamp)
-    if backup_type == BACKUP_TYPE_LOGICAL:
+    if backup_type in (BACKUP_TYPE_LOGICAL, BACKUP_TYPE_PARTIAL_LOGICAL):
         extension = BACKUP_TYPE_LOGICAL_EXTENSION
     elif backup_type == BACKUP_TYPE_XBSTREAM:
         extension = BACKUP_TYPE_XBSTREAM_EXTENSION
     else:
         raise Exception('Unsupported backup type {}'.format(backup_type))
+
+    try:
+        replica_set = instance.guess_zk_replica_set()
+    except:
+        log.info('Looks like the db is not in zk, going to initial build '
+                 'naming conventions for a backup')
+        initial_build = True
 
     if initial_build:
         return BACKUP_FILE_INITIAL.format(
@@ -128,59 +159,130 @@ def create_backup_file_name(instance, timestamp, initial_build, backup_type):
             extension=extension)
     else:
         return BACKUP_FILE.format(
-             retention_policy=environment_specific.get_backup_retention_policy(instance),
+             retention_policy=environment_specific.get_backup_retention_policy(
+                    instance),
              backup_type=backup_type,
-             replica_set=instance.get_zk_replica_set()[0],
+             replica_set=replica_set,
              hostname=instance.hostname,
              port=instance.port,
              timestamp=timestamp_formatted,
              extension=extension)
 
 
-def logical_backup_instance(instance, timestamp, initial_build):
+def logical_backup_instance(instance, timestamp, blackhole=False,
+                            initial_build=False, databases=None):
     """ Take a compressed mysqldump backup
 
     Args:
-    instance - A hostaddr instance
-    timestamp - A timestamp which will be used to create the backup filename
-    initial_build - Boolean, if this is being created right after the server
-                    was built
+        instance - A hostaddr instance
+        timestamp - A timestamp which will be used to create the backup filename
+        blackhole - Boolean, if set will backup DBs as blackhole tables
+                    with no indexes or data
+        initial_build - Boolean, if this is being created right after the server
+                      was built
+        databases - List, if set backup only a subset of databases
 
     Returns:
-    A string of the path to the finished backup
+        An S3 key of the backup.
     """
-    backup_file = create_backup_file_name(instance, timestamp,
-                                          initial_build,
-                                          BACKUP_TYPE_LOGICAL)
-    (dump_user,
-     dump_pass) = mysql_lib.get_mysql_user_for_role(USER_ROLE_MYSQLDUMP)
+    zk = host_utils.MysqlZookeeper()
+    try:
+        replica_type = zk.get_replica_type_from_instance(instance)
+    except:
+        # instance is not in production
+        replica_type = host_utils.REPLICA_ROLE_MASTER
+
+    arg_repl_coordinate = ARG_MASTER_DATA \
+        if replica_type == host_utils.REPLICA_ROLE_MASTER else ARG_SLAVE_DATA
+
+    arg_no_data = ARG_NO_DATA if blackhole else ''
+    if databases:
+        backup_type = BACKUP_TYPE_PARTIAL_LOGICAL
+        db_args = ARG_DATABASES.format(dbs=' '.join(databases))
+    else:
+        backup_type = BACKUP_TYPE_LOGICAL
+        db_args = ARG_ALL_DATABASES
+
+    arg_replace = ARG_REPLACE if databases == [mysql_lib.METADATA_DB] else ''
+    dump_user, dump_pass = mysql_lib.get_mysql_user_for_role(USER_ROLE_MYSQLDUMP)
+
     dump_cmd = MYSQLDUMP_CMD.format(dump_user=dump_user,
                                     dump_pass=dump_pass,
                                     host=instance.hostname,
-                                    port=instance.port).split()
+                                    port=instance.port,
+                                    db_args=db_args,
+                                    net_buffer_length=MAX_INSERT_LENGTH,
+                                    arg_repl_coordinate=arg_repl_coordinate,
+                                    arg_replace=arg_replace,
+                                    arg_no_data=arg_no_data).split()
 
+    backup_file = create_backup_file_name(instance, timestamp,
+                                          initial_build,
+                                          backup_type)
     procs = dict()
-    try:
-        log.info(' '.join(dump_cmd + ['|']))
-        procs['mysqldump'] = subprocess.Popen(dump_cmd,
-                                              stdout=subprocess.PIPE)
-        procs['pv'] = create_pv_proc(procs['mysqldump'].stdout)
-        log.info(' '.join(PIGZ + ['|']))
-        procs['pigz'] = subprocess.Popen(PIGZ,
-                                         stdin=procs['pv'].stdout,
-                                         stdout=subprocess.PIPE)
-        log.info('Uploading backup to s3://{buk}/{key}'
-                 ''.format(buk=environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
-                           key=backup_file))
-        safe_uploader.safe_upload(precursor_procs=procs,
-                                  stdin=procs['pigz'].stdout,
-                                  bucket=environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
-                                  key=backup_file)
-        log.info('mysqldump was successful')
-        return backup_file
-    except:
-        safe_uploader.kill_precursor_procs(procs)
-        raise
+    log.info(' '.join(dump_cmd + ['|']))
+    procs['mysqldump'] = subprocess.Popen(dump_cmd,
+                                          stdout=subprocess.PIPE)
+    if blackhole:
+        procs['innodb_to_blackhole'] = subprocess.Popen(
+                INNODB_TO_BLACKHOLE,
+                shell=True,
+                stdin=procs['mysqldump'].stdout,
+                stdout=subprocess.PIPE)
+        log.info(' '.join([INNODB_TO_BLACKHOLE, '|']))
+
+        # Blackhole only supports indexes up to 1k long, which is shorter
+        # than InnoDB. We are therefore removing indexes and
+        # auto_inc columns.
+        procs['remove_auto_inc_col_arg'] = subprocess.Popen(
+                REMOVE_AUTO_INC_COL_ARG,
+                shell=True,
+                stdin=procs['innodb_to_blackhole'].stdout,
+                stdout=subprocess.PIPE)
+        log.info(' '.join([REMOVE_AUTO_INC_COL_ARG, '|']))
+
+        procs['remove_auto_inc_start_value'] = subprocess.Popen(
+                REMOVE_AUTO_INC_START_VALUE,
+                shell=True,
+                stdin=procs['remove_auto_inc_col_arg'].stdout,
+                stdout=subprocess.PIPE)
+        log.info(' '.join([REMOVE_AUTO_INC_START_VALUE, '|']))
+
+        procs['remove_indexes'] = subprocess.Popen(
+                REMOVE_INDEXES,
+                shell=True,
+                stdin=procs['remove_auto_inc_start_value'].stdout,
+                stdout=subprocess.PIPE)
+        log.info(' '.join([REMOVE_INDEXES, '|']))
+        stdout = procs['remove_indexes'].stdout
+
+    elif databases == [mysql_lib.METADATA_DB]:
+        # If we are backing up the metadata db, we don't want to nuke
+        # existing data, but need to copy existing data over for rbr
+        # to work.
+        procs['create_if_not_exists_sed'] = subprocess.Popen(
+                CREATE_IF_NOT_EXISTS_SED,
+                shell=True,
+                stdin=procs['mysqldump'].stdout,
+                stdout=subprocess.PIPE)
+        log.info(' '.join([CREATE_IF_NOT_EXISTS_SED, '|']))
+        stdout = procs['create_if_not_exists_sed'].stdout
+    else:
+        stdout = procs['mysqldump'].stdout
+
+    log.info(' '.join(PIGZ + ['|']))
+    procs['pigz'] = subprocess.Popen(PIGZ,
+                                     stdin=stdout,
+                                     stdout=subprocess.PIPE)
+    key = safe_uploader.safe_upload(
+            precursor_procs=procs,
+            stdin=procs['pigz'].stdout,
+            bucket=environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
+            key=backup_file,
+            verbose=True)
+
+    log.info('mysqldump was successful')
+    return key
 
 
 def xtrabackup_instance(instance, timestamp, initial_build):
@@ -206,27 +308,20 @@ def xtrabackup_instance(instance, timestamp, initial_build):
                             ts=time.strftime('%Y-%m-%d-%H:%M:%S', timestamp)))
     tmp_log_handle = open(tmp_log, "w")
     procs = dict()
-    try:
-        cmd = create_xtrabackup_command(instance, timestamp, tmp_log)
-        log.info(' '.join(cmd + [' 2> ', tmp_log, ' | ']))
-        procs['xtrabackup'] = subprocess.Popen(cmd,
-                                               stdout=subprocess.PIPE,
-                                               stderr=tmp_log_handle)
-        procs['pv'] = create_pv_proc(procs['xtrabackup'].stdout)
-        log.info('Uploading backup to s3://{buk}/{loc}'
-                 ''.format(buk=environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
-                           loc=backup_file))
-        safe_uploader.safe_upload(precursor_procs=procs,
-                                  bucket=environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
-                                  stdin=procs['pv'].stdout,
-                                  key=backup_file,
-                                  check_func=check_xtrabackup_log,
-                                  check_arg=tmp_log)
-        log.info('Xtrabackup was successful')
-        return backup_file
-    except:
-        safe_uploader.kill_precursor_procs(procs)
-        raise
+    cmd = create_xtrabackup_command(instance, timestamp, tmp_log)
+    log.info(' '.join(cmd + [' 2> ', tmp_log, ' | ']))
+    procs['xtrabackup'] = subprocess.Popen(cmd,
+                                           stdout=subprocess.PIPE,
+                                           stderr=tmp_log_handle)
+    safe_uploader.safe_upload(precursor_procs=procs,
+                              bucket=environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()],
+                              stdin=procs['xtrabackup'].stdout,
+                              key=backup_file,
+                              check_func=check_xtrabackup_log,
+                              check_arg=tmp_log,
+                              verbose=True)
+    log.info('Xtrabackup was successful')
+    return backup_file
 
 
 def check_xtrabackup_log(tmp_log):
@@ -281,19 +376,19 @@ def get_s3_backup(instance, date, backup_type):
     backup_keys = list()
     prefixes = set()
     try:
-        replica_set = instance.get_zk_replica_set()[0]
+        replica_set = instance.guess_zk_replica_set()
     except:
         log.debug('Instance {} is not in zk'.format(instance))
         replica_set = None
 
     if replica_set:
         prefixes.add(BACKUP_SEARCH_PREFIX.format(
-                         retention_policy=environment_specific.get_backup_retention_policy(instance),
-                         backup_type=backup_type,
-                         replica_set=replica_set,
-                         hostname=instance.hostname,
-                         port=instance.port,
-                         timestamp=date))
+            retention_policy=environment_specific.get_backup_retention_policy(instance),
+            backup_type=backup_type,
+            replica_set=replica_set,
+            hostname=instance.hostname,
+            port=instance.port,
+            timestamp=date))
 
     prefixes.add(BACKUP_SEARCH_INITIAL_PREFIX.format(
                      backup_type=backup_type,
@@ -312,7 +407,6 @@ def get_s3_backup(instance, date, backup_type):
             for key in bucket_items:
                 if (key.size <= MINIMUM_VALID_BACKUP_SIZE_BYTES):
                     continue
-
                 backup_keys.append(key)
 
     if not backup_keys:
@@ -450,20 +544,40 @@ def get_age_last_restore(replica_set):
         sql = ("SELECT restore_file "
                "FROM test.xb_restore_status "
                "WHERE restore_status='OK' "
+               " AND finished_at > NOW() - INTERVAL {LARGE_RESTORE_AGE} DAY "
                "ORDER BY finished_at DESC "
-               "LIMIT 10")
-        # The most recent restore is not always using the newest restore file
-        # so we will just grab the 10 most recent.
+               "LIMIT 1"
+               ).format(LARGE_RESTORE_AGE=LARGE_RESTORE_AGE)
         cursor.execute(sql)
-        restores = cursor.fetchall()
-    except Exception as e:
-        log.error(e)
-        return
-
-    for restore in restores:
+        restore = cursor.fetchone()
         _, creation = get_metadata_from_backup_file(restore['restore_file'])
-        if age is None or (today - creation).days < age:
-            age = (today - creation).days
+        age = (today - creation).days
+
+        if age is None:
+            log.info('No restore table entries, setting restore age for'
+                     'replica set {rs} to {big}'
+                     ''.format(rs=replica_set,
+                               big=LARGE_RESTORE_AGE))
+            age = LARGE_RESTORE_AGE
+
+    except Exception as e:
+        log.error(': '.join([replica_set, e.__str__()]))
+        if e.args[0] == mysql_lib.MYSQL_ERROR_NO_SUCH_TABLE:
+            log.info('No restore table, setting restore age for replica set '
+                     '{rs} to {big}'
+                     ''.format(rs=replica_set,
+                               big=LARGE_RESTORE_AGE))
+            age = LARGE_RESTORE_AGE
+        elif e.args[0] == mysql_lib.MYSQL_ERROR_CONN_HOST_ERROR:
+            log.info('Could not connect, setting restore age for replica {} '
+                     'to 0'
+                     ''.format(replica_set))
+            age = 0
+        else:
+            log.info('Unhandled exception, setting restore age for replica '
+                     '{rs} to {big}'.format(rs=replica_set,
+                                       big=LARGE_RESTORE_AGE))
+            age = LARGE_RESTORE_AGE
 
     return (age, replica_set)
 
@@ -545,7 +659,7 @@ def apply_log(datadir, memory=None):
         # Determine how much RAM to use for applying logs based on the
         # system's total RAM size; all our boxes have 32G or more, so
         # this will always be better than before, but not absurdly high.
-        memory = psutil.phymem_usage()[0] / 1024 / 1024 / 1024 / 3
+        memory = psutil.virtual_memory()[0] / 1024 / 1024 / 1024 / 3
 
     cmd = ' '.join(('/usr/bin/innobackupex',
                     '--apply-log',
@@ -646,11 +760,24 @@ def create_s3_download_proc(key):
                             preexec_fn=pre_exec)
 
 
-def create_pv_proc(stdin, size=None):
+def create_pv_proc(stdin, size=None, rate_limit=None):
+    """ Create a pv process with various args
+
+    Args:
+    stdin - The stdin from a subprocess.Popen using stdout=subprocess.PIPE
+    size - Size in bytes, used for creating an eta
+    rate_limit - Rate limit to bytes per second
+
+    Returns: A pv process
+    """
     cmd = copy.copy(PV)
     if size:
         cmd.append('--size')
         cmd.append(str(size))
+
+    if rate_limit:
+        cmd.append('--rate-limit')
+        cmd.append(str(rate_limit))
 
     log.info(' '.join(cmd + ['|']))
     return subprocess.Popen(cmd,
@@ -659,9 +786,110 @@ def create_pv_proc(stdin, size=None):
 
 
 def create_xbstream_proc(stdin, datadir):
+    """ Create a xbstream extraction process
+
+    Args:
+    stdin - An xbstream flowing through out of a subprocess.Popen using
+            stdout=subprocess.PIPE
+    datadir - Where to extract the data
+
+    Returns: a xbstream process
+    """
     cmd = copy.copy(XBSTREAM)
     cmd.append('--directory={}'.format(datadir))
     log.info(' '.join(cmd))
     return subprocess.Popen(cmd,
                             stdin=stdin,
                             stdout=subprocess.PIPE)
+
+
+def get_csv_backup_paths(instance, db, table, date):
+    """ Get all relevant paths for a csv backup
+
+    Args:
+        instance - a hostAddr object
+        db - a database name
+        table - a table name
+        date - The date in string form
+
+    Returns:
+        schema_path - the path to the scheam file in s3
+        data_path - the path to the data file in s3
+        sucess_path - the path to the success file in s3
+    """
+    zk = host_utils.MysqlZookeeper()
+    replica_set = zk.get_replica_set_from_instance(instance)
+    hostname_prefix = instance.hostname_prefix
+    if instance.hostname_prefix in environment_specific.FLEXSHARD_DBS:
+        if not replica_set:
+            raise Exception("For flexsharddb's, replica_set must be supplied")
+        schema_raw = environment_specific.PATH_DAILY_FLEXSHARDED_SCHEMA
+        data_raw = environment_specific.PATH_DAILY_FLEXSHARDED_DATA
+        success_raw = environment_specific.PATH_DAILY_FLEXSHARDED_SUCCESS
+        namespace = hostname_prefix
+    elif instance.hostname_prefix in environment_specific.SHARDED_DBS_PREFIX:
+        if db.startswith(environment_specific.ZEN_MULTI_PREFACE):
+            zen_multi = re.match(environment_specific.ZEN_MULTI_PATTERN, db)
+            namespace = '{hostname_prefix}_{service}'.format(
+                            service=zen_multi.group(1),
+                            hostname_prefix=hostname_prefix)
+        else:
+            namespace = instance.hostname_prefix
+        schema_raw = environment_specific.PATH_DAILY_SHARDED_SCHEMA
+        data_raw = environment_specific.PATH_DAILY_SHARDED_DATA
+        success_raw = environment_specific.PATH_DAILY_SHARDED_SUCCESS
+    else:
+        if not replica_set:
+            raise Exception("For unsharded DBs, replica_set must be supplied")
+        schema_raw = environment_specific.PATH_DAILY_NONSHARDED_SCHEMA
+        data_raw = environment_specific.PATH_DAILY_NONSHARDED_DATA
+        success_raw = environment_specific.PATH_DAILY_NONSHARDED_SUCCESS
+        namespace = replica_set
+    return (schema_raw.format(namespace=namespace,
+                              db_name=db,
+                              table=table,
+                              date=date,
+                              replica_set=replica_set),
+            data_raw.format(namespace=namespace,
+                            db_name=db,
+                            table=table,
+                            date=date,
+                            replica_set=replica_set),
+            success_raw.format(namespace=namespace,
+                               db_name=db,
+                               table=table,
+                               date=date,
+                               replica_set=replica_set))
+
+
+def filter_tables_to_csv_backup(instance, db, tables):
+    """ Determine which tables should be backed up in a db
+
+    Args:
+        instance - A hostAddr object
+        db -  The db for which we need a list of tables eligible for backup
+        tables - A set of tables
+
+    Returns:
+        A set of table names
+    """
+    ret_tables = set()
+    if instance.hostname_prefix in environment_specific.FLEXSHARD_DBS:
+        if db not in environment_specific.FLEXSHARDED_IGNORABLE_DBS:
+            for table in tables:
+                skip = False
+                for suffix in environment_specific.FLEXSHARDED_IGNORABLE_TABLES_SUFFIX:
+                    if table.endswith(suffix):
+                        skip = True
+                if not skip:
+                    ret_tables.add(table)
+    elif instance.hostname_prefix in environment_specific.SHARDED_DBS_PREFIX:
+        for table in tables:
+            for suffix in environment_specific.SHARDED_IGNORABLE_TABLES_SUFFIX:
+                if not table.endswith(suffix):
+                    ret_tables.add(table)
+    else:
+        if db not in environment_specific.NONSHARDED_IGNORABLE_DBS:
+            ret_tables = tables
+
+    return ret_tables

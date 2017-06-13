@@ -33,22 +33,27 @@ log.addHandler(chat_handler)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action',
-                        help='What action to take. The first step is '
-                             'add_to_queue which add a server to the queue '
-                             'and resets some status. The "shutdown_mysql" '
-                             'runs against all servers in the queue for more '
-                             'than a day, and it checks statistics and if ok, '
-                             'shutsdown MySQL. The "terminate_instance" will '
-                             'terminate instances a day after "shutdown_mysql" '
-                             'has run. If (un)protect_instance" then the '
-                             'supplied host will be (un)exempted from '
-                             'retirement/termination. get_protected_hosts '
-                             'will display what is protected from retirement',
-                        choices=['add_to_queue', 'process_mysql_shutdown',
-                                 'terminate_instances', 'protect_instance',
-                                 'unprotect_instance', 'get_protected_hosts',
-                                 'show_queue'])
+    parser.add_argument(
+        'action',
+        help='What action to take. The first step is '
+        'add_to_queue which add a server to the queue '
+        'and resets some status. The "shutdown_mysql" '
+        'runs against all servers in the queue for more '
+        'than a day, and it checks statistics and if ok, '
+        'shutsdown MySQL. The "terminate_instance" will '
+        'terminate instances a day after "shutdown_mysql" '
+        'has run. If (un)protect_instance" then the '
+        'supplied host will be (un)exempted from '
+        'retirement/termination. get_protected_hosts '
+        'will display what is protected from retirement',
+        choices=[
+            'add_to_queue',
+            'process_mysql_shutdown',
+            'terminate_instances',
+            'protect_instance',
+            'unprotect_instance',
+            'get_protected_hosts',
+            'show_queue'])
     parser.add_argument('--dry_run',
                         help="Don't change any state",
                         action='store_true')
@@ -133,7 +138,9 @@ def add_to_queue(hostname, dry_run, skip_production_check=False):
                                 "very dangerous!".format(instance=instance))
     all_servers = environment_specific.get_all_server_metadata()
     if hostname not in all_servers:
-        raise Exception('Host {hostname} is not cmdb'.format(hostname=hostname))
+        raise Exception(
+            'Host {hostname} is not cmdb'.format(
+                hostname=hostname))
 
     instance_metadata = all_servers[hostname]
     log.info(instance_metadata)
@@ -153,7 +160,9 @@ def add_to_queue(hostname, dry_run, skip_production_check=False):
             if dry_run:
                 log.info('In dry_run mode, not changing anything')
             else:
-                mysql_lib.enable_and_flush_activity_statistics(host_utils.HostAddr(hostname))
+                mysql_lib.stop_event_scheduler(host_utils.HostAddr(hostname))
+                mysql_lib.enable_and_flush_activity_statistics(
+                    host_utils.HostAddr(hostname))
         else:
             log.info("No recent user activity, skipping stats reset")
 
@@ -166,8 +175,8 @@ def add_to_queue(hostname, dry_run, skip_production_check=False):
         (error_code, msg) = detail.args
         if error_code != mysql_lib.MYSQL_ERROR_CONN_HOST_ERROR:
             raise
-        log.info('Could not connect to '
-                 '{ip}'.format(ip=instance_metadata['internal_ip']))
+        log.info('Could not connect to {}'
+                 ''.format(instance_metadata['internal_ip']))
         activity = SHUTDOWN_MYSQL
 
         # We only want to add the host if it wasn't already in the queue
@@ -189,11 +198,11 @@ def process_mysql_shutdown(hostname=None, dry_run=False):
 
     if hostname:
         if hostname in shutdown_instances:
-            log.info('Only acting on {hostname}'.format(hostname=hostname))
+            log.info('Only acting on {}'.format(hostname))
             shutdown_instances = {hostname: shutdown_instances[hostname]}
         else:
-            log.info('Supplied host {hostname} is not ready '
-                     'for shutdown'.format(hostname=hostname))
+            log.info('Supplied host {} is not ready '
+                     'for shutdown'.format(hostname))
             return
 
     for instance in shutdown_instances:
@@ -210,20 +219,26 @@ def process_mysql_shutdown(hostname=None, dry_run=False):
                             "it from zk and try again"
                             "".format(instance=instance))
                 continue
-        # check mysql activity
-        if check_for_user_activity(shutdown_instances[instance]):
-            continue
 
-        # joining on a blank string as password must not have a space between
-        # the flag and the arg
         if dry_run:
             log.info('In dry_run mode, not changing state')
-        else:
-            log.info('Shuting down mysql on {instance}'.format(instance=instance))
-            mysql_lib.shutdown_mysql(host_utils.HostAddr(instance))
-            log_to_retirement_queue(instance,
-                                    shutdown_instances[instance]['instance_id'],
-                                    SHUTDOWN_MYSQL)
+            continue
+
+        try:
+            if check_for_user_activity(shutdown_instances[instance]):
+                continue
+            else:
+                log.info('Shutting down mysql on {}'.format(instance))
+                mysql_lib.shutdown_mysql(host_utils.HostAddr(instance))
+        except MySQLdb.OperationalError as detail:
+            (error_code, msg) = detail.args
+            if error_code != mysql_lib.MYSQL_ERROR_CONN_HOST_ERROR:
+                raise
+            log.warning("Can't connect to MySQL on {}".format(instance))
+
+        log_to_retirement_queue(instance,
+                                shutdown_instances[instance]['instance_id'],
+                                SHUTDOWN_MYSQL)
 
 
 def terminate_instances(hostname=None, dry_run=False):
@@ -259,26 +274,29 @@ def terminate_instances(hostname=None, dry_run=False):
 
         try:
             with timeout.timeout(3):
-                conn = MySQLdb.connect(host=terminate_instances[hostname]['internal_ip'],
-                                       user=username,
-                                       passwd=password,
-                                       cursorclass=MySQLdb.cursors.DictCursor)
+                conn = MySQLdb.connect(
+                    host=terminate_instances[hostname]['internal_ip'],
+                    user=username,
+                    passwd=password,
+                    cursorclass=MySQLdb.cursors.DictCursor)
             log.error('Did not get MYSQL_ERROR_CONN_HOST_ERROR')
+            conn.close()
             continue
         except MySQLdb.OperationalError as detail:
             (error_code, msg) = detail.args
             if error_code != mysql_lib.MYSQL_ERROR_CONN_HOST_ERROR:
                 raise
             log.info('MySQL is down')
-        log.info('Terminating instance '
-                 '{instance}'.format(instance=terminate_instances[hostname]['instance_id']))
+        log.info('Terminating instance ' '{instance}'.format(
+            instance=terminate_instances[hostname]['instance_id']))
         if dry_run:
             log.info('In dry_run mode, not changing state')
         else:
-            botoconn.terminate_instances(instance_ids=[terminate_instances[hostname]['instance_id']])
-            log_to_retirement_queue(hostname,
-                                    terminate_instances[hostname]['instance_id'],
-                                    TERMINATE_INSTANCE)
+            botoconn.terminate_instances(
+                instance_ids=[
+                    terminate_instances[hostname]['instance_id']])
+            log_to_retirement_queue(hostname, terminate_instances[hostname][
+                                    'instance_id'], TERMINATE_INSTANCE)
 
 
 def unprotect_host(hostname):
@@ -358,22 +376,14 @@ def show_queue():
 
 
 def check_for_user_activity(instance):
-    zk = host_utils.MysqlZookeeper()
     username, password = mysql_lib.get_mysql_user_for_role('admin')
 
     # check mysql activity
-    log.info('Checking activity on {instance}'.format(instance=instance['hostname']))
-    with timeout.timeout(3):
-        conn = MySQLdb.connect(host=instance['internal_ip'],
-                               user=username,
-                               passwd=password,
-                               cursorclass=MySQLdb.cursors.DictCursor)
-    if not conn:
-        raise Exception('Could not connect to {ip}'
-                        ''.format(ip=instance['internal_ip']))
+    log.info('Checking activity on {}'.format(instance['hostname']))
 
     activity = mysql_lib.get_user_activity(host_utils.HostAddr(instance['hostname']))
     unexpected = set(activity.keys()).difference(IGNORABLE_USERS)
+
     if unexpected:
         log.error('Unexpected activity on {instance} by user(s):'
                   '{unexpected}'.format(instance=instance['hostname'],
@@ -382,7 +392,19 @@ def check_for_user_activity(instance):
 
     log.info('Checking current connections on '
              '{instance}'.format(instance=instance['hostname']))
-    connected_users = mysql_lib.get_connected_users(host_utils.HostAddr(instance['hostname']))
+    # try catch here due to the query creates the temp file will break our
+    # code if disk space is full
+    try:
+        connected_users = mysql_lib.get_connected_users(
+            host_utils.HostAddr(instance['hostname']))
+    except MySQLdb.InternalError as detail:
+        (err_code, msg) = detail.args
+        if err_code == mysql_lib.MYSQL_ERROR_CANT_CREATE_WRITE_TO_FILE:
+            log.info('No space left on device')
+            return False
+    except:
+        log.info('Something else is not correct here')
+        return False
     unexpected = connected_users.difference(IGNORABLE_USERS)
     if unexpected:
         log.error('Unexpected connection on {instance} by user(s):'
@@ -456,16 +478,15 @@ def get_retirement_queue_servers(next_state, recent=False):
                 "    AND happened < now() - INTERVAL 18 HOUR ")
     reporting_conn = mysql_lib.get_mysqlops_connections()
     cursor = reporting_conn.cursor()
-    sql = ("SELECT t1.hostname, t1.instance_id, t1.happened "
-           "FROM ( "
-           "    SELECT hostname, instance_id, happened "
-           "    FROM mysqlops.retirement_queue "
-           "    WHERE activity = %(previous_state)s "
-           + when +
-           "    ) t1 "
-           "LEFT JOIN mysqlops.retirement_queue t2 on t1.instance_id = t2.instance_id "
-           "AND t2.activity=%(next_state)s "
-           "WHERE t2.hostname IS NULL;")
+    sql = (
+        "SELECT t1.hostname, t1.instance_id, t1.happened "
+        "FROM ( "
+        "    SELECT hostname, instance_id, happened "
+        "    FROM mysqlops.retirement_queue "
+        "    WHERE activity = %(previous_state)s " + when + "    ) t1 "
+        "LEFT JOIN mysqlops.retirement_queue t2 on t1.instance_id = t2.instance_id "
+        "AND t2.activity=%(next_state)s "
+        "WHERE t2.hostname IS NULL;")
     cursor.execute(sql, server_state)
     instances = cursor.fetchall()
 

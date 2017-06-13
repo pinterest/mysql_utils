@@ -8,7 +8,7 @@ import json
 
 '''
 Zlib's implementation uses 262 bytes of overhead for pre-defined dictionary
-thus, the max zdict size is 32KB - 262B = 32506B
+thus, the max zdict size is 32KB - 262B = 23506B
 '''
 MAX_WINDOW_SIZE = 32506  # 32KB-262B, size of MAX_WBITS - zdict overhead
 MAX_LOOKAHEAD_BUFFER_SIZE = 258  # Maximum Match Length in zlib

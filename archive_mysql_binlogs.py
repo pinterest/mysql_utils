@@ -5,7 +5,6 @@ import os
 import boto
 import boto.s3.key
 import logging
-import multiprocessing
 import subprocess
 import time
 import traceback
@@ -29,7 +28,7 @@ BINLOG_ARCHIVING_TABLE = """CREATE TABLE IF NOT EXISTS {db}.{tbl} (
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1"""
 BINLOG_S3_BASE_DIR = 'binlogs'
 STANDARD_RETENTION_BINLOG_S3_DIR = 'standard_retention'
-BINLOG_LOCK_FILE = '/tmp/archive_mysql_binlogs.lock'
+BINLOG_LOCK_SOCKET = 'archivebinlogs'
 BINLOG_INFINITE_REPEATER_TERM_FILE = '/tmp/archive_mysql_binlogs_infinite.die'
 MAX_ERRORS = 5
 TMP_DIR = '/tmp/'
@@ -63,43 +62,39 @@ def archive_mysql_binlogs(port, dry_run):
     instance = host_utils.HostAddr(':'.join((host_utils.HOSTNAME,
                                              str(port))))
 
-    if zk.get_replica_set_from_instance(instance)[0] is None:
+    if zk.get_replica_set_from_instance(instance) is None:
         log.info('Instance is not in production, exiting')
         return
 
-    lock_handle = None
     ensure_binlog_archiving_table_sanity(instance)
-    try:
-        log.info('Taking binlog archiver lock')
-        lock_handle = host_utils.take_flock_lock(BINLOG_LOCK_FILE)
-        log_bin_dir = host_utils.get_cnf_setting('log_bin', port)
-        bin_logs = mysql_lib.get_master_logs(instance)
-        logged_uploads = get_logged_binlog_uploads(instance)
-        for binlog in bin_logs[:-1]:
-            err_count = 0
-            local_file = os.path.join(os.path.dirname(log_bin_dir),
-                                      binlog['Log_name'])
-            if already_uploaded(instance, local_file, logged_uploads):
-                continue
-            success = False
-            while not success:
-                try:
-                    upload_binlog(instance, local_file, dry_run)
-                    success = True
-                except:
-                    if err_count > MAX_ERRORS:
-                        log.error('Error count in thread > MAX_THREAD_ERROR. '
-                                  'Aborting :(')
-                        raise
+    log.info('Taking binlog archiver lock')
+    lock_handle = host_utils.bind_lock_socket(BINLOG_LOCK_SOCKET)
+    log_bin_dir = host_utils.get_cnf_setting('log_bin', port)
+    bin_logs = mysql_lib.get_master_logs(instance)
+    logged_uploads = get_logged_binlog_uploads(instance)
+    for binlog in bin_logs[:-1]:
+        err_count = 0
+        local_file = os.path.join(os.path.dirname(log_bin_dir),
+                                  binlog['Log_name'])
+        if already_uploaded(instance, local_file, logged_uploads):
+            continue
+        success = False
+        while not success:
+            try:
+                upload_binlog(instance, local_file, dry_run)
+                success = True
+            except:
+                if err_count > MAX_ERRORS:
+                    log.error('Error count in thread > MAX_THREAD_ERROR. '
+                              'Aborting :(')
+                    raise
 
-                    log.error('error: {e}'.format(e=traceback.format_exc()))
-                    err_count = err_count + 1
-                    time.sleep(err_count*2)
-        log.info('Archiving complete')
-    finally:
-        if lock_handle:
-            log.info('Releasing lock')
-            host_utils.release_flock_lock(lock_handle)
+                log.error('error: {e}'.format(e=traceback.format_exc()))
+                err_count = err_count + 1
+                time.sleep(err_count * 2)
+
+    host_utils.release_lock_socket(lock_handle)
+    log.info('Archiving complete')
 
 
 def already_uploaded(instance, binlog, logged_uploads):
@@ -138,27 +133,19 @@ def upload_binlog(instance, binlog, dry_run):
     """
     s3_upload_path = s3_binlog_path(instance, binlog)
     bucket = environment_specific.BACKUP_BUCKET_UPLOAD_MAP[host_utils.get_iam_role()]
-    log.info('Local file {local_file} will uploaded to s3://{buk}/{s3_upload_path}'
-             ''.format(local_file=binlog,
-                       buk=bucket,
-                       s3_upload_path=s3_upload_path))
 
     if dry_run:
         log.info('In dry_run mode, skipping compression and upload')
         return
 
     procs = dict()
-    try:
-        procs['lzop'] = subprocess.Popen(['lzop', binlog, '--to-stdout'],
-                                         stdout=subprocess.PIPE)
-        safe_uploader.safe_upload(precursor_procs=procs,
-                                  stdin=procs['lzop'].stdout,
-                                  bucket=bucket,
-                                  key=s3_upload_path)
-    except:
-        log.debug('In exception handling for failed binlog upload')
-        safe_uploader.kill_precursor_procs(procs)
-        raise
+    procs['lzop'] = subprocess.Popen(['lzop', binlog, '--to-stdout'],
+                                     stdout=subprocess.PIPE)
+    safe_uploader.safe_upload(precursor_procs=procs,
+                              stdin=procs['lzop'].stdout,
+                              bucket=bucket,
+                              key=s3_upload_path,
+                              verbose=True)
     log_binlog_upload(instance, binlog)
 
 
@@ -171,9 +158,9 @@ def log_binlog_upload(instance, binlog):
     """
     zk = host_utils.MysqlZookeeper()
     binlog_creation = datetime.datetime.fromtimestamp(os.stat(binlog).st_atime)
-    replica_set = zk.get_replica_set_from_instance(instance)[0]
+    replica_set = zk.get_replica_set_from_instance(instance)
     master = zk.get_mysql_instance_from_replica_set(replica_set)
-    conn = mysql_lib.connect_mysql(master, 'scriptrw')
+    conn = mysql_lib.connect_mysql(master, 'dbascript')
     cursor = conn.cursor()
     sql = ("REPLACE INTO {metadata_db}.{tbl} "
            "SET hostname = %(hostname)s, "
@@ -199,7 +186,7 @@ def get_logged_binlog_uploads(instance):
     Returns:
     A set of binlog file names
     """
-    conn = mysql_lib.connect_mysql(instance, 'scriptro')
+    conn = mysql_lib.connect_mysql(instance, 'dbascript')
     cursor = conn.cursor()
     sql = ("SELECT binlog "
            "FROM {metadata_db}.{tbl} "
@@ -224,15 +211,16 @@ def ensure_binlog_archiving_table_sanity(instance):
                the instance if the instance is not a master
     """
     zk = host_utils.MysqlZookeeper()
-    replica_set = zk.get_replica_set_from_instance(instance)[0]
+    replica_set = zk.get_replica_set_from_instance(instance)
     master = zk.get_mysql_instance_from_replica_set(replica_set)
-    conn = mysql_lib.connect_mysql(master, 'scriptrw')
+    conn = mysql_lib.connect_mysql(master, 'dbascript')
     cursor = conn.cursor()
     if not mysql_lib.does_table_exist(master, mysql_lib.METADATA_DB,
-                                      environment_specific.BINLOG_ARCHIVING_TABLE_NAME):
-            log.debug('Creating missing metadata table')
-            cursor.execute(BINLOG_ARCHIVING_TABLE.format(db=mysql_lib.METADATA_DB,
-                                                         tbl=environment_specific.BINLOG_ARCHIVING_TABLE_NAME))
+            environment_specific.BINLOG_ARCHIVING_TABLE_NAME):
+        log.debug('Creating missing metadata table')
+        cursor.execute(BINLOG_ARCHIVING_TABLE.format(
+            db=mysql_lib.METADATA_DB,
+            tbl=environment_specific.BINLOG_ARCHIVING_TABLE_NAME))
     sql = ("DELETE FROM {metadata_db}.{tbl} "
            "WHERE binlog_creation < now() - INTERVAL {d} DAY"
            "").format(metadata_db=mysql_lib.METADATA_DB,
@@ -257,7 +245,7 @@ def s3_binlog_path(instance, binlog):
     # retention for pinlater
     return os.path.join(BINLOG_S3_BASE_DIR,
                         STANDARD_RETENTION_BINLOG_S3_DIR,
-                        instance.replica_type,
+                        instance.hostname_prefix,
                         instance.hostname,
                         str(instance.port),
                         ''.join((os.path.basename(binlog),

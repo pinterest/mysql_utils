@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 import argparse
+import boto
 import datetime
+import logging
 import subprocess
 import time
-
-import boto
 
 import modify_mysql_zk
 import mysql_backup
@@ -17,13 +17,15 @@ from lib import mysql_lib
 
 SCARY_TIMEOUT = 20
 
+log = logging.getLogger(__name__)
+
 
 def main():
     description = 'Utility to download and restore MySQL xbstream backups'
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('-b',
                         '--backup_type',
-                        help='Type of backup to restore. Default is xtrabackup',
+                        help='Type of backup to restore. Default: xtrabackup',
                         default=backup.BACKUP_TYPE_XBSTREAM,
                         choices=(backup.BACKUP_TYPE_LOGICAL,
                                  backup.BACKUP_TYPE_XBSTREAM))
@@ -101,8 +103,8 @@ def restore_instance(backup_type, restore_source, destination,
     prod_check(destination, skip_production_check)
 
     # Take a lock to prevent multiple restores from running concurrently
-    log.info('Taking a flock to block another restore from starting')
-    lock_handle = host_utils.take_flock_lock(backup.BACKUP_LOCK_FILE)
+    log.info('Taking a lock to block another restore from starting')
+    lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
 
     log.info('Looking for a backup to restore')
     if restore_source:
@@ -114,21 +116,24 @@ def restore_instance(backup_type, restore_source, destination,
 
     # Figure out what what we use to as the master when we setup replication
     (restore_source, _) = backup.get_metadata_from_backup_file(backup_key.name)
-    if restore_source.get_zk_replica_set():
-        replica_set = restore_source.get_zk_replica_set()[0]
-        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
-    else:
+    try:
+        replica_set = restore_source.get_zk_replica_set()
+        master = zk.get_mysql_instance_from_replica_set(replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+    except:
         # ZK has no idea what this replica set is, probably a new replica set.
         master = restore_source
 
     # Start logging
-    row_id = backup.start_restore_log(master, {'restore_source': restore_source,
-                                               'restore_port': destination.port,
-                                               'restore_file': backup_key.name,
-                                               'source_instance': destination.hostname,
-                                               'restore_date': date,
-                                               'replication': no_repl,
-                                               'zookeeper': add_to_zk})
+    row_id = backup.start_restore_log(master, {
+                'restore_source': restore_source,
+                'restore_port': destination.port,
+                'restore_file': backup_key.name,
+                'source_instance': destination.hostname,
+                'restore_date': date,
+                'replication': no_repl,
+                'zookeeper': add_to_zk})
+
     # Giant try to allow logging if anything goes wrong.
     try:
         # If we hit an exception, this status will be used. If not, it will
@@ -137,19 +142,39 @@ def restore_instance(backup_type, restore_source, destination,
 
         # This also ensures that all needed directories exist
         log.info('Rebuilding local mysql instance')
-        mysql_init_server.mysql_init_server(destination, skip_production_check=True,
-                                            skip_backup=True, skip_locking=True)
+        lock_handle = mysql_init_server.mysql_init_server(
+                        destination,
+                        skip_production_check=True,
+                        skip_backup=True,
+                        lock_handle=lock_handle)
 
         if backup_type == backup.BACKUP_TYPE_XBSTREAM:
             xbstream_restore(backup_key, destination.port)
             if master == restore_source:
-                log.info('Pulling replication info from restore to backup source')
-                (binlog_file, binlog_pos) = backup.parse_xtrabackup_binlog_info(destination.port)
+                log.info('Pulling replication info from restore to '
+                         'backup source')
+                (binlog_file,
+                 binlog_pos) = backup.parse_xtrabackup_binlog_info(
+                                destination.port)
             else:
                 log.info('Pulling replication info from restore to '
                          'master of backup source')
-                (binlog_file, binlog_pos) = backup.parse_xtrabackup_slave_info(destination.port)
+                (binlog_file,
+                 binlog_pos) = backup.parse_xtrabackup_slave_info(
+                                destination.port)
         elif backup_type == backup.BACKUP_TYPE_LOGICAL:
+            log.info('Preparing replication')
+            # We are importing a mysqldump which was created with
+            # --master-data or --dump-slave so there will be a CHANGE MASTER
+            # statement at the start of the dump. MySQL will basically just
+            # ignore a CHANGE MASTER command if master_host is not already
+            # setup. So we are setting master_host, username and password
+            # here. We use BOGUS for master_log_file so that the IO thread is
+            # intentionally broken.  With no argument for master_log_file,
+            # the IO thread would start downloading the first bin log and
+            # the SQL thread would start executing...
+            mysql_lib.change_master(destination, master, 'BOGUS', 0,
+                                    no_start=True)
             logical_restore(backup_key, destination)
             host_utils.stop_mysql(destination.port)
 
@@ -157,8 +182,10 @@ def restore_instance(backup_type, restore_source, destination,
         host_utils.upgrade_auth_tables(destination.port)
 
         log.info('Starting MySQL')
-        host_utils.start_mysql(destination.port,
-                               options=host_utils.DEFAULTS_FILE_EXTRA_ARG.format(defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
+        host_utils.start_mysql(
+            destination.port,
+            options=host_utils.DEFAULTS_FILE_EXTRA_ARG.format(
+            defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
 
         # Since we haven't started the slave yet, make sure we've got these
         # plugins installed, whether we use them or not.
@@ -180,7 +207,7 @@ def restore_instance(backup_type, restore_source, destination,
             else:
                 mysql_lib.restart_replication(destination)
         if no_repl == 'REQ':
-            mysql_lib.wait_replication_catch_up(destination)
+            mysql_lib.wait_for_catch_up(destination)
         restore_log_update['replication'] = 'OK'
 
         host_utils.restart_pt_daemons(destination.port)
@@ -193,21 +220,41 @@ def restore_instance(backup_type, restore_source, destination,
             restore_log_update['finished_at'] = True
         raise
     finally:
+        # As with mysql_init_server, we have to do one more restart to
+        # clear out lock ownership, but here we have to also do it with
+        # the proper config file.
         if lock_handle:
-            log.info('Releasing lock')
-            host_utils.release_flock_lock(lock_handle)
+            log.info('Releasing lock and restarting MySQL')
+            host_utils.stop_mysql(destination.port)
+            time.sleep(5)
+            host_utils.release_lock_socket(lock_handle)
+            if no_repl == 'SKIP':
+                host_utils.start_mysql(
+                    destination.port,
+                    options=host_utils.DEFAULTS_FILE_EXTRA_ARG.format(
+                    defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
+            else:
+                host_utils.start_mysql(destination.port)
+
         backup.update_restore_log(master, row_id, restore_log_update)
 
     try:
         if add_to_zk == 'REQ':
-            log.info('Adding instance to zk')
+            if no_repl == 'REQ':
+                log.info('Waiting for replication again, as it may have '
+                         'drifted due to restart.')
+                mysql_lib.wait_for_catch_up(destination)
+                log.info('Waiting for IO lag in case it is still too '
+                         'far even wait for resync ')
+                mysql_lib.wait_for_catch_up(destination, io=True)
+            log.info('Adding instance to zk.')
             modify_mysql_zk.auto_add_instance_to_zk(destination.port,
                                                     dry_run=False)
             backup.update_restore_log(master, row_id, {'zookeeper': 'OK'})
         else:
             log.info('add_to_zk is not set, therefore not adding to zk')
     except Exception as e:
-        log.warning("An exception occurred: {e}".format(e=e))
+        log.warning("An exception occurred: {}".format(e))
         log.warning("If this is a DB issue, that's fine. "
                     "Otherwise, you should check ZK.")
     backup.update_restore_log(master, row_id, {'finished_at': True})
@@ -221,12 +268,12 @@ def prod_check(destination, skip_production_check):
     """ Confirm it is ok to overwrite the destination instance
 
     Args:
-    destination - Hostaddr obect for where to restore the backup
+    destination - Hostaddr object for where to restore the backup
     skip_production_check - If set, it is ok to run on slabes
     """
     zk = host_utils.MysqlZookeeper()
     try:
-        (_, replica_type) = zk.get_replica_set_from_instance(destination)
+        replica_type = zk.get_replica_type_from_instance(destination)
     except:
         # instance is not in production
         replica_type = None
@@ -263,14 +310,15 @@ def get_possible_sources(destination, backup_type):
     Returns A list of hostAddr objects
     """
     zk = host_utils.MysqlZookeeper()
-    replica_set = destination.get_zk_replica_set()[0]
+    replica_set = destination.guess_zk_replica_set()
     possible_sources = []
     for role in host_utils.REPLICA_TYPES:
         if (role == host_utils.REPLICA_ROLE_MASTER and
                 backup_type == backup.BACKUP_TYPE_LOGICAL):
             continue
         else:
-            instance = zk.get_mysql_instance_from_replica_set(replica_set, role)
+            instance = zk.get_mysql_instance_from_replica_set(replica_set,
+                                                              role)
             if instance:
                 possible_sources.append(instance)
 
@@ -292,7 +340,7 @@ def find_a_backup_to_restore(possible_sources, destination,
     retore_file - Where the file exists on whichever storage
     restore_size - What is the size of the backup in bytes
     """
-    log.info('Possible source hosts:{possible_sources}'.format(possible_sources=possible_sources))
+    log.info('Possible source hosts:{}'.format(possible_sources))
 
     if date:
         dates = [date]
@@ -308,7 +356,7 @@ def find_a_backup_to_restore(possible_sources, destination,
             # we are looping to older dates, if we already found some keys, we
             # quit looking
             continue
-        log.info('Looking for a backup for {restore_date}'.format(restore_date=restore_date))
+        log.info('Looking for a backup for {}'.format(restore_date))
         for possible_source in possible_sources:
             try:
                 possible_keys.extend(backup.get_s3_backup(possible_source,
@@ -378,39 +426,39 @@ def logical_restore(dump, destination):
     destination -  a hostaddr object for where the data should be loaded on
                    localhost
     """
-    log.info('Preparing replication')
-    (restore_source, _) = backup.get_metadata_from_backup_file(dump.name)
-    # We are importing a mysqldump which was created with --master-data
-    # so there will be a CHANGE MASTER statement at the start of the dump.
-    # MySQL will basically just ignore a CHANGE MASTER command if
-    # master_host is not already setup. So we are setting master_host,
-    # username and password here. We use BOGUS for master_log_file so that
-    # the IO thread is intentionally broken. With no argument for
-    # master_log_file, the IO thread would start downloading the first bin log
-    # and the SQL thread would start executing...
-    mysql_lib.change_master(destination, restore_source, 'BOGUS', 0,
-                            no_start=True)
-    log.info('Restarting MySQL to turn off enforce_storage_engine')
-    host_utils.stop_mysql(destination.port)
-    host_utils.start_mysql(destination.port,
-                           host_utils.DEFAULTS_FILE_ARG.format(defaults_file=host_utils.MYSQL_UPGRADE_CNF_FILE))
+    (user, password) = mysql_lib.get_mysql_user_for_role('admin')
+    if dump.name.startswith(backup.BACKUP_TYPE_PARTIAL_LOGICAL):
+        # TODO: check if db is empty before applying rate limit
+        rate_limit = backup.MAX_TRANSFER_RATE
+    else:
+        log.info('Restarting MySQL to turn off enforce_storage_engine')
+        host_utils.stop_mysql(destination.port)
+        host_utils.start_mysql(destination.port,
+                           host_utils.DEFAULTS_FILE_ARG.format(
+                           defaults_file=host_utils.MYSQL_UPGRADE_CNF_FILE))
+        rate_limit = None
+
     log.info('Downloading, decompressing and importing backup')
     procs = dict()
     procs['s3_download'] = backup.create_s3_download_proc(dump)
     procs['pv'] = backup.create_pv_proc(procs['s3_download'].stdout,
-                                        size=dump.size)
+                                        size=dump.size,
+                                        rate_limit=rate_limit)
     log.info('zcat |')
     procs['zcat'] = subprocess.Popen(['zcat'],
                                      stdin=procs['pv'].stdout,
                                      stdout=subprocess.PIPE)
-    mysql_cmd = ['mysql', '--port', str(destination.port)]
+    mysql_cmd = ['mysql', 
+                 '--port={}'.format(str(destination.port)),
+                 '--host={}'.format(destination.hostname),
+                 '--user={}'.format(user),
+                 '--password={}'.format(password)]
     log.info(' '.join(mysql_cmd))
     procs['mysql'] = subprocess.Popen(mysql_cmd,
-                                      stdin=procs['zcat'].stdout,
-                                      stdout=subprocess.PIPE)
+                                      stdin=procs['zcat'].stdout)
     while(not host_utils.check_dict_of_procs(procs)):
         time.sleep(.5)
 
 if __name__ == "__main__":
-    log = environment_specific.setup_logging_defaults(__name__)
+    environment_specific.initialize_logger()
     main()

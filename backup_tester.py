@@ -1,15 +1,12 @@
 #!/usr/bin/env python
 import argparse
-import datetime
 import logging
 import multiprocessing
-
-import MySQLdb
+import pprint
 
 from lib import backup
 from lib import environment_specific
 from lib import host_utils
-from lib import mysql_lib
 import launch_replacement_db_host
 
 log = logging.getLogger(__name__)
@@ -50,6 +47,8 @@ def launch_restores_as_needed(dry_run=True):
 
     launched = 0
     min_launches = min_test_launches()
+    log.info('Current restore age: {}'
+             ''.format(pprint.pformat(restore_age)))
     for days in sorted(restore_age.keys(), reverse=True):
         for replica_set in restore_age[days]:
             launch = False

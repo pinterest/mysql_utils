@@ -5,6 +5,7 @@ import inspect
 import boto.ec2
 
 import launch_replacement_db_host
+from lib import host_utils
 from lib import mysql_lib
 from lib import environment_specific
 
@@ -28,11 +29,15 @@ def main():
     parser.add_argument('--mysql_major_version',
                         choices=environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS,
                         default=launch_replacement_db_host.DEFAULT_MYSQL_MAJOR_VERSION,
-                        help='Default: {default}'.format(default=launch_replacement_db_host.DEFAULT_MYSQL_MAJOR_VERSION))
+                        help='Default: {}'.format(launch_replacement_db_host.DEFAULT_MYSQL_MAJOR_VERSION))
     parser.add_argument('--mysql_minor_version',
                         choices=environment_specific.SUPPORTED_MYSQL_MINOR_VERSIONS,
                         default=launch_replacement_db_host.DEFAULT_MYSQL_MINOR_VERSION,
-                        help='Default: {default}'.format(default=launch_replacement_db_host.DEFAULT_MYSQL_MINOR_VERSION))
+                        help='Default: {}'.format(launch_replacement_db_host.DEFAULT_MYSQL_MINOR_VERSION))
+    parser.add_argument('--os_flavor',
+                        choices=environment_specific.SUPPORTED_OS_FLAVORS,
+                        default=launch_replacement_db_host.DEFAULT_OS_FLAVOR,
+                        help='Default: {}'.format(launch_replacement_db_host.DEFAULT_OS_FLAVOR))
     parser.add_argument('--dry_run',
                         help=('Do not actually launch an instance, just show '
                               'the intended configuration'),
@@ -47,12 +52,13 @@ def main():
                                availability_zone=args.availability_zone,
                                mysql_major_version=args.mysql_major_version,
                                mysql_minor_version=args.mysql_minor_version,
+                               os_flavor=args.os_flavor,
                                dry_run=args.dry_run)
 
 
 def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
                                availability_zone, mysql_major_version, mysql_minor_version,
-                               dry_run, skip_name_check=False):
+                               os_flavor, dry_run, skip_name_check=False):
     """ Launch a mysql server in aws
 
     Args:
@@ -63,6 +69,7 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
     mysql_major_version - MySQL major version. Example 5.5 or 5.6
     mysql_minor_version - Which "branch" to use. Values are 'stable', 'staging'
                           and 'latest'.
+    os_flavor - Which OS to target - 'precise' or 'trusty' at the moment
     dry_run - Do not actually launch a host, just show the expected config.
     skip_name_check - Do not check if a hostname has already been used or log
                       usage. The assumption is the caller has already done this
@@ -75,10 +82,13 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
         log.info("Requested {param} = {value}".format(param=param,
                                                       value=values[param]))
 
+    if host_utils.get_security_role() not in environment_specific.ROLE_TO_LAUNCH_INSTANCE:
+        raise Exception(environment_specific.ROLE_ERROR_MSG)
+
     config = {'key_name': environment_specific.PEM_KEY,
               'placement': availability_zone,
               'instance_profile_name': environment_specific.INSTANCE_PROFILE_NAME,
-              'image_id': environment_specific.SUPPORTED_HARDWARE[instance_type]['ami'],
+              'image_id': environment_specific.SUPPORTED_HARDWARE[instance_type]['ami'][os_flavor],
               'instance_type': instance_type}
 
     (subnet_name, config['subnet_id']) = get_subnet_from_sg(vpc_security_group,
@@ -97,6 +107,7 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
                         'Supported configs are: {supported}'
                         ''.format(hiera_config=hiera_config,
                                   supported=environment_specific.SUPPORTED_HIERA_CONFIGS))
+
     config['user_data'] = ('#cloud-config\n'
                            'pinfo_team: {pinfo_team}\n'
                            'pinfo_env: {pinfo_env}\n'

@@ -1,133 +1,73 @@
-#!/usr/bin/env python
-import argparse
+import logging
+import multiprocessing
 import os
-import psutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib
 
-from lib import environment_specific
-from lib import host_utils
+import boto
+import psutil
 
-ATTEMPTS = 5
-BLOCK = 262144
+PROGRESS_PROC = 'progress'
+PV = ['/usr/bin/pv', '-peafbt']
+PYTHON = 'python'
+REPEATER_PROC = 'repeater'
+REPEATER_SCRIPT = 'safe_uploader_repeater.py'
 S3_SCRIPT = '/usr/local/bin/gof3r'
 SLEEP_TIME = .25
-TERM_DIR = 'repeater_lock_dir'
 TERM_STRING = 'TIME_TO_DIE'
+UPLOADER_PROC = 'uploader'
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("terminate_path",
-                        help='When a file appears at this path, exit')
-    args = parser.parse_args()
-
-    while True:
-        data = sys.stdin.read(BLOCK)
-        if len(data) == 0:
-            time.sleep(.25)
-
-            # write empty data to detect broken pipes
-            sys.stdout.write(data)
-
-            if os.path.exists(args.terminate_path):
-                if check_term_file(args.terminate_path):
-                    sys.exit(0)
-        else:
-            sys.stdout.write(data)
-
-
-def get_exec_path():
-    """ Get the path to this executable
-
-    Returns:
-    the path as a string of this script
-    """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        __file__)
-    if path.endswith('.pyc'):
-        return path[:-1]
-    else:
-        return path
-
-
-def get_term_dir():
-    """ Get the directory where we will place files to communicate, creating
-        it if needed.
-
-    Returns
-    a directory
-    """
-    term_dir = os.path.join(environment_specific.RAID_MOUNT, TERM_DIR)
-    if not os.path.exists(term_dir):
-        os.mkdir(term_dir)
-    return term_dir
-
-
-def get_term_file():
-    """ Get a path to a file in the TERM_DIR which can be used to communicate
-
-    Returns
-    a path to a file created by tempfile.mkstemp
-    """
-    term_dir = get_term_dir()
-    (handle, path) = tempfile.mkstemp(dir=term_dir)
-    os.close(handle)
-    return path
-
-
-def check_term_file(term_path):
-    """ Check to see if a term file has been populated with a magic string
-        meaning that the repeater code can terminate
-
-    Returns
-    True if the file has been populated, false otherwise
-    """
-    with open(term_path, 'r') as term_handle:
-        contents = term_handle.read(len(TERM_STRING))
-    if contents == TERM_STRING:
-        return True
-    else:
-        return False
+log = logging.getLogger(__name__)
 
 
 def safe_upload(precursor_procs, stdin, bucket, key,
-                check_func=None, check_arg=None):
+                check_func=None, check_arg=None, verbose=False):
     """ For sures, safely upload a file to s3
 
     Args:
     precursor_procs - A dict of procs that will be monitored
     stdin - The stdout from the last proc in precursor_procs that will be
-             uploaded
+            uploaded
     bucket - The s3 bucket where we should upload the data
     key - The name of the key which will be the destination of the data
     check_func - An optional function that if supplied will be run after all
-                 procs in precursor_procs have finished.
+                 procs in precursor_procs have finished. If the uploader should
+                 abort, then an exception should be thrown in the function.
     check_args - The arguments to supply to the check_func
+    verbose - If True, display upload speeds statistics and destination
     """
     upload_procs = dict()
     devnull = open(os.devnull, 'w')
+    term_path = None
     try:
         term_path = get_term_file()
-        upload_procs['repeater'] = subprocess.Popen(
-                                       [get_exec_path(), term_path],
-                                       stdin=stdin,
-                                       stdout=subprocess.PIPE)
-        upload_procs['uploader'] = subprocess.Popen(
-                                       [S3_SCRIPT, 'put',
-                                        '-k', urllib.quote_plus(key),
-                                        '-b', bucket],
-                                       stdin=upload_procs['repeater'].stdout,
-                                       stderr=devnull)
+        if verbose:
+            log.info('Uploading to s3://{buk}/{key}'.format(buk=bucket,
+                                                            key=key))
+            upload_procs[PROGRESS_PROC] = subprocess.Popen(
+                PV,
+                stdin=stdin,
+                stdout=subprocess.PIPE)
+            stdin = upload_procs[PROGRESS_PROC].stdout
+        upload_procs[REPEATER_PROC] = subprocess.Popen(
+            [PYTHON, get_exec_path(), term_path],
+            stdin=stdin,
+            stdout=subprocess.PIPE)
+        upload_procs[UPLOADER_PROC] = subprocess.Popen(
+            [S3_SCRIPT,
+             'put',
+             '-k', urllib.quote_plus(key),
+             '-b', bucket],
+            stdin=upload_procs[REPEATER_PROC].stdout,
+            stderr=devnull)
 
         # While the precursor procs are running, we need to make sure
         # none of them have errors and also check that the upload procs
         # also don't have errors.
-        while not host_utils.check_dict_of_procs(precursor_procs):
-            host_utils.check_dict_of_procs(upload_procs)
+        while not check_dict_of_procs(precursor_procs):
+            check_dict_of_procs(upload_procs)
             time.sleep(SLEEP_TIME)
 
         # Once the precursor procs have exited successfully, we will run
@@ -137,48 +77,118 @@ def safe_upload(precursor_procs, stdin, bucket, key,
 
         # And then create the term file which will cause the repeater and
         # uploader to exit
-        with open(term_path, 'w') as term_handle:
-            term_handle.write(TERM_STRING)
+        write_term_file(term_path)
 
         # And finally we will wait for the uploader procs to exit without error
-        while not host_utils.check_dict_of_procs(upload_procs):
+        while not check_dict_of_procs(upload_procs):
             time.sleep(SLEEP_TIME)
     except:
-        # So there has been some sort of a problem. We want to make sure that
-        # we kill the uploader so that under no circumstances the upload is
-        # successfull with bad data
-        if 'uploader' in upload_procs and\
-                psutil.pid_exists(upload_procs['uploader'].pid):
-            try:
-                upload_procs['uploader'].kill()
-            except:
-                pass
-
-        if 'repeater' in upload_procs and\
-                psutil.pid_exists(upload_procs['repeater'].pid):
-            try:
-                upload_procs['repeater'].kill()
-            except:
-                pass
+        clean_up_procs(upload_procs, precursor_procs)
         raise
     finally:
-        os.remove(term_path)
+        if term_path:
+            os.remove(term_path)
+
+    # Assuming all went well, return the new S3 key.
+    conn = boto.connect_s3()
+    bucket_conn = conn.get_bucket(bucket, validate=False)
+    return bucket_conn.get_key(key)
 
 
-def kill_precursor_procs(procs):
-    """ In the case of a failure, we will need to kill off the precursor_procs
+def get_exec_path():
+    """ Get the path to this executable
+
+    Returns:
+    the path as a string of this script
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        REPEATER_SCRIPT)
+    return path
+
+
+def get_term_file():
+    """ Get a path to a file which can be used to communicate
+
+    Returns
+    a path to a file created by tempfile.mkstemp
+    """
+    (handle, path) = tempfile.mkstemp()
+    os.close(handle)
+    return path
+
+
+def write_term_file(term_path):
+    """ Create the termination file
 
     Args:
-    procs - a set of processes
+    term_path - Where to write the magic string to terminate the repeater
     """
-    for proc in procs:
-        if procs[proc] and psutil.pid_exists(procs[proc].pid):
-            try:
-                procs[proc].kill()
-            except:
-                # process no longer exists, no big deal.
-                pass
+    with open(term_path, 'w') as term_handle:
+        term_handle.write(TERM_STRING)
+
+def try_kill(proc):
+    """ Try to kill a process
+
+    Args:
+    proc - A process created by subprocess.Popen
+    """
+    if not psutil.pid_exists(proc.pid):
+        return
+
+    try:
+        proc.kill()
+        proc.wait()
+    except:
+        pass
 
 
-if __name__ == "__main__":
-    main()
+def check_dict_of_procs(proc_dict):
+    """ Check a dict of process for exit, error, etc...
+
+    Args:
+    A dict of processes
+
+    Returns: True if all processes have completed with return status 0
+             False is some processes are still running
+             An exception is generated if any processes have completed with a
+             returns status other than 0
+    """
+    success = True
+    for proc in proc_dict:
+        ret = proc_dict[proc].poll()
+        if ret is None:
+            # process has not yet terminated
+            success = False
+        elif ret != 0:
+            if multiprocessing.current_process().name != 'MainProcess':
+                proc_id = '{}: '.format(multiprocessing.current_process().name)
+            else:
+                proc_id = ''
+
+            raise Exception('{proc_id}{proc} encountered an error'
+                            ''.format(proc_id=proc_id,
+                                      proc=proc))
+    return success
+
+
+def clean_up_procs(upload_procs, precursor_procs):
+    """ Clean up the pipeline procs in a safe order
+
+    Args:
+    upload_procs -  A dictionary of procs used for the upload
+    precursor_procs - A dictionary of procs that feed the uploader
+    """
+    # So there has been some sort of a problem. We want to make sure that
+    # we kill the uploader so that under no circumstances the upload is
+    # successfull with bad data
+    if UPLOADER_PROC in upload_procs:
+        try_kill(upload_procs[UPLOADER_PROC])
+        del upload_procs[UPLOADER_PROC]
+
+    # Next the repeater and the pv (if applicable)
+    for proc in upload_procs:
+        try_kill(upload_procs[proc])
+
+    # And finally whatever is feeding the uploader
+    for proc in precursor_procs:
+        try_kill(precursor_procs[proc])

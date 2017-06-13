@@ -145,7 +145,7 @@ def get_checksums(instance, db=False):
         vars_for_query['shard1'] = db
 
     # connect to the instance we care about and get some data.
-    conn = mysql_lib.connect_mysql(instance, 'scriptrw')
+    conn = mysql_lib.connect_mysql(instance, 'dbascript')
 
     # We only care about the most recent checksum
     cursor = conn.cursor()

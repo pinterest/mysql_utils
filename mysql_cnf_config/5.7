@@ -1,0 +1,28 @@
+[mysqld3306]
+remove_performance_schema = WE_SHOULD_START_USING_THIS
+remove_innodb_file_format = BARRACUDA_IS_NOW_DEFAULT
+remove_innodb_purge_threads = 4_IS_NOW_DEFAULT
+remove_innodb_log_block_size = NOT_USED_ANYMORE
+remove_enforce_storage_engine = DISABLE_THEM_INSTEAD
+remove_log_warnings_suppress = HAS_BEEN_REMOVED
+remove_innodb_max_dirty_pages_pct = 75_IS_DEFAULT_NOW
+
+default_storage_engine = InnoDB
+disabled_storage_engines = "MyISAM,FEDERATED,ARCHIVE,MRG_MyISAM,CSV"
+sql_mode="NO_ENGINE_SUBSTITUTION,NO_AUTO_CREATE_USER"
+
+log_error_verbosity = 3
+log_statements_unsafe_for_binlog = 0
+innodb_page_cleaners = 16
+innodb_flush_neighbors = 0
+innodb_io_capacity_max = 800
+
+master_info_repository = FILE
+relay_log_info_repository = TABLE
+loose_rpl_semi_sync_master_enabled = 1
+loose_rpl_semi_sync_slave_enabled = 1
+loose_rpl_semi_sync_master_timeout = 60000
+loose_rpl_semi_sync_master_wait_no_slave = OFF
+
+optimizer_trace_max_mem_size = 1M
+metadata_locks_hash_instances = 256

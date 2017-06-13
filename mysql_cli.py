@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 import argparse
-from lib import environment_specific
+import logging
 import socket
 import string
 import subprocess
 
+from lib import environment_specific
 from lib import host_utils
 from lib import mysql_lib
 
@@ -20,13 +21,15 @@ MYSQL_CLI_EX = ('/usr/bin/mysql -A -h {host} -P {port} {sql_safe} '
 
 DEFAULT_ROLE = 'read-only'
 
+log = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('db',
                         help='What server, shard or replica set to connect to '
-                             '(ie sharddb021b[:3306], db00003, pbdata03862, '
-                             'follower_zendata001002)')
+                             '(e.g., sharddb-21-2[:3306], db00003, pbdata03862, '
+                             'zenfollowermysql_zendata001002, '
+                             'zenshared_video_zendata000002, etc.)')
     parser.add_argument('-p',
                         '--privileges',
                         help=''.join(('Default is ', DEFAULT_ROLE)),
@@ -59,33 +62,27 @@ def main():
     try:
         socket.gethostbyname(args.db)
         host = host_utils.HostAddr(args.db)
-        log.info('{db} appears to be a hostname'.format(db=args.db))
+        log.info('{} appears to be a hostname'.format(args.db))
     except:
-        log.info('{db} appears not to be a hostname'.format(db=args.db))
+        log.info('{} appears not to be a hostname'.format(args.db))
 
     # Maybe it is a replica set
     if not host:
-        config = zk.get_all_mysql_config()
-        if args.db in config:
-            master = config[args.db]['master']
-            log.info('{db} appears to be a replica set'.format(db=args.db))
-            host = host_utils.HostAddr(''.join((master['host'],
-                                                ':',
-                                                str(master['port']))))
-        else:
-            log.info('{db} appears not to be a replica set'.format(db=args.db))
+        try:
+            host = zk.get_mysql_instance_from_replica_set(args.db)
+            log.info('{} appears to be a replica set'.format(args.db))
+        except:
+            log.info('{} appears not to be a replica set'.format(args.db))
 
     # Perhaps a shard?
     if not host:
-        shard_map = zk.get_host_shard_map()
-        for master in shard_map:
-            if args.db in shard_map[master]:
-                log.info('{db} appears to be a shard'.format(db=args.db))
-                host = host_utils.HostAddr(master)
-                db = environment_specific.convert_shard_to_db(args.db)
-                break
-        if not host:
-            log.info('{db} appears not to be a shard'.format(db=args.db))
+        try:
+            (replica_set, db) = zk.map_shard_to_replica_and_db(args.db)
+            host = zk.get_mysql_instance_from_replica_set(replica_set)
+            log.info('{} appears to be a shard'.format(args.db))
+        except:
+            log.info('{} appears not to be a shard'.format(args.db))
+            raise
 
     if not host:
         raise Exception('Could not determine what host to connect to')
@@ -101,7 +98,7 @@ def main():
     # this point.
     sql_safe = ''
     try:
-        replica_set, _ = zk.get_replica_set_from_instance(host)
+        replica_set = zk.get_replica_set_from_instance(host)
     except Exception as e:
         if 'is not in zk' in e.message:
             log.warning('SERVER IS NOT IN ZK!!!')
@@ -112,6 +109,7 @@ def main():
     try:
         # do we need a prompt?
         if replica_set in environment_specific.EXTRA_PARANOID_REPLICA_SETS:
+            warn = environment_specific.EXTRA_PARANOID_ALERTS.get(replica_set)
             if args.privileges in ['read-write', 'admin']:
                 resp = raw_input("You've asked for {priv} access to replica "
                                  "set {rs}.  Are you sure? (Y/N): ".format(
@@ -119,6 +117,8 @@ def main():
                                     rs=replica_set))
                 if not resp or resp[0] not in ['Y', 'y']:
                     raise Exception('Connection aborted by user!')
+                else:
+                    print warn
 
         # should we enable safe-updates?
         if replica_set in environment_specific.PARANOID_REPLICA_SETS:
@@ -150,5 +150,5 @@ def main():
     proc.wait()
 
 if __name__ == "__main__":
-    log = environment_specific.setup_logging_defaults(__name__)
+    environment_specific.initialize_logger()
     main()

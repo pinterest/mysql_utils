@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import os
 import time
 
 from lib import backup
@@ -27,7 +28,8 @@ def main():
     mysql_backup(instance, args.backup_type)
 
 
-def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM, initial_build=False):
+def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM,
+                 initial_build=False, lock_handle=None):
     """ Run a file based backup on a supplied local instance
 
     Args:
@@ -35,11 +37,19 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM, initial_buil
     backup_type - backup.BACKUP_TYPE_LOGICAL or backup.BACKUP_TYPE_XBSTREAM
     initial_build - Boolean, if this is being created right after the server
                     was built
+    lock_handle - A lock handle, if we have one from the caller.
     """
+
+    if backup_type == backup.BACKUP_TYPE_XBSTREAM and \
+            os.path.isfile(backup.XTRABACKUP_SKIP_FILE):
+        log.info('Found {}. Skipping xtrabackup '
+                 'run.'.format(backup.XTRABACKUP_SKIP_FILE))
+        return
+
     log.info('Confirming sanity of replication (if applicable)')
     zk = host_utils.MysqlZookeeper()
     try:
-        (_, replica_type) = zk.get_replica_set_from_instance(instance)
+        replica_type = zk.get_replica_type_from_instance(instance)
     except:
         # instance is not in production
         replica_type = None
@@ -49,28 +59,32 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM, initial_buil
 
     log.info('Logging initial status to mysqlops')
     start_timestamp = time.localtime()
-    lock_handle = None
     backup_id = mysql_lib.start_backup_log(instance, backup_type,
                                            start_timestamp)
 
     # Take a lock to prevent multiple backups from running concurrently
-    try:
+    # unless we already have a lock from the caller.  This means we
+    # also don't have to release the lock at the end; either we
+    # exit the script entirely, and it gets cleaned up or the caller
+    # maintains it.
+    if lock_handle is None:
         log.info('Taking backup lock')
-        lock_handle = host_utils.take_flock_lock(backup.BACKUP_LOCK_FILE)
+        lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
+    else:
+        log.info('Not acquiring backup lock, we already have one.')
 
-        # Actually run the backup
-        log.info('Running backup')
-        if backup_type == backup.BACKUP_TYPE_XBSTREAM:
-            backup_file = backup.xtrabackup_instance(instance, start_timestamp, initial_build)
-        elif backup_type == backup.BACKUP_TYPE_LOGICAL:
-            backup_file = backup.logical_backup_instance(instance, start_timestamp, initial_build)
-        else:
-            raise Exception('Unsupported backup type {backup_type}'
-                            ''.format(backup_type=backup_type))
-    finally:
-        if lock_handle:
-            log.info('Releasing lock')
-            host_utils.release_flock_lock(lock_handle)
+    # Actually run the backup
+    log.info('Running backup')
+    if backup_type == backup.BACKUP_TYPE_XBSTREAM:
+        backup_file = backup.xtrabackup_instance(instance, start_timestamp,
+                                                 initial_build)
+    elif backup_type == backup.BACKUP_TYPE_LOGICAL:
+        # We don't need a backup-skip file here since this isn't
+        # regularly scheduled.
+        backup_file = backup.logical_backup_instance(instance, start_timestamp,
+                                                     initial_build)
+    else:
+        raise Exception('Unsupported backup type {}'.format(backup_type))
 
     # Update database with additional info now that backup is done.
     if backup_id:

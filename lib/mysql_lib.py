@@ -42,6 +42,7 @@ INVALID = 'INVALID'
 METADATA_DB = 'test'
 MYSQL_DATETIME_TO_PYTHON = '%Y-%m-%dT%H:%M:%S.%f'
 MYSQLADMIN = '/usr/bin/mysqladmin'
+MYSQL_ERROR_CANT_CREATE_WRITE_TO_FILE = 1
 MYSQL_ERROR_ACCESS_DENIED = 1045
 MYSQL_ERROR_CONN_HOST_ERROR = 2003
 MYSQL_ERROR_HOST_ACCESS_DENIED = 1130
@@ -261,7 +262,7 @@ def get_slave_status(instance):
     cursor.execute("SHOW SLAVE STATUS")
     slave_status = cursor.fetchone()
     if slave_status is None:
-        raise ReplicationError('Server is not a replica')
+        raise ReplicationError('Instance {} is not a slave'.format(instance))
     return slave_status
 
 
@@ -375,7 +376,7 @@ def calc_binlog_behind(log_file_num, log_file_pos, master_logs):
     bytes_behind = 0
     for binlog in master_logs:
         _, binlog_num = re.split('\.', binlog['Log_name'])
-        if binlog_num >= log_file_num:
+        if int(binlog_num) >= int(log_file_num):
             if binlog_num == log_file_num:
                 bytes_behind += binlog['File_size'] - log_file_pos
             else:
@@ -752,16 +753,35 @@ def create_db(instance, db):
 
     Args:
     instance - a hostAddr object
-    db - the name of the to be created
+    db - the name of the db to be created
     """
     conn = connect_mysql(instance)
     cursor = conn.cursor()
 
-    sql = ('CREATE DATABASE IF NOT EXISTS '
-           '`{db}`;'.format(db=db))
+    sql = ('CREATE DATABASE IF NOT EXISTS `{}`'.format(db))
     log.info(sql)
 
     # We don't care if the db already exists and this was a no-op
+    warnings.filterwarnings('ignore', category=MySQLdb.Warning)
+    cursor.execute(sql)
+    warnings.resetwarnings()
+
+
+def drop_db(instance, db):
+    """ Drop a database, if it exists.
+
+    Args:
+    instance - a hostAddr object
+    db - the name of the db to be dropped
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    sql = ('DROP DATABASE IF EXISTS `{}`'.format(db))
+    log.info(sql)
+
+    # If the DB isn't there, we'd throw a warning, but we don't
+    # actually care; this will be a no-op.
     warnings.filterwarnings('ignore', category=MySQLdb.Warning)
     cursor.execute(sql)
     warnings.resetwarnings()
@@ -791,7 +811,7 @@ def copy_db_schema(instance, old_db, new_db, verbose=False, dry_run=False):
             cursor.execute(sql)
 
 
-def move_db_contents(instance, old_db, new_db, verbose=False, dry_run=False):
+def move_db_contents(instance, old_db, new_db, dry_run=False):
     """ Move the contents of one db into a different db
 
     Args:
@@ -808,11 +828,57 @@ def move_db_contents(instance, old_db, new_db, verbose=False, dry_run=False):
     for table in tables:
         raw_sql = "RENAME TABLE `{old_db}`.`{table}` to `{new_db}`.`{table}`"
         sql = raw_sql.format(old_db=old_db, new_db=new_db, table=table)
-        if verbose:
-            print sql
+        log.info(sql)
 
         if not dry_run:
             cursor.execute(sql)
+
+
+def start_event_scheduler(instance):
+    """ Enable the event scheduler on a given MySQL server.
+
+    Args:
+        instance: The hostAddr object to act upon.
+    """
+    cmd = 'SET GLOBAL event_scheduler=ON'
+
+    # We don't use the event scheduler in many places, but if we're
+    # not able to start it when we want to, that could be a big deal.
+    try:
+        conn = connect_mysql(instance)
+        cursor = conn.cursor()
+        warnings.filterwarnings('ignore', category=MySQLdb.Warning)
+        log.info(cmd)
+        cursor.execute(cmd)
+    except Exception as e:
+        log.error('Unable to start event scheduler: {}'.format(e))
+        raise
+    finally:
+        warnings.resetwarnings()
+
+
+def stop_event_scheduler(instance):
+    """ Disable the event scheduler on a given MySQL server.
+
+    Args:
+        instance: The hostAddr object to act upon.
+    """
+    cmd = 'SET GLOBAL event_scheduler=OFF'
+
+    # If for some reason we're unable to disable the event scheduler,
+    # that isn't likely to be a big deal, so we'll just pass after
+    # logging the exception.
+    try:
+        conn = connect_mysql(instance)
+        cursor = conn.cursor()
+        warnings.filterwarnings('ignore', category=MySQLdb.Warning)
+        log.info(cmd)
+        cursor.execute(cmd)
+    except Exception as e:
+        log.error('Unable to stop event scheduler: {}'.format(e))
+        pass
+    finally:
+        warnings.resetwarnings()
 
 
 def setup_replication(new_master, new_replica):
@@ -926,7 +992,7 @@ def reset_slave(instance):
 
 
 def change_master(slave_hostaddr, master_hostaddr, master_log_file,
-                  master_log_pos, no_start=False):
+                  master_log_pos, no_start=False, skip_set_readonly=False):
     """ Setup MySQL replication on new replica
 
     Args:
@@ -934,12 +1000,15 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
     hostaddr - A hostaddr object for the master db
     master_log_file - Replication log file to begin streaming
     master_log_pos - Position in master_log_file
-    no_start - Don't run START SLAVE after CHANGE MASTER
+    no_start - If set, don't run START SLAVE after CHANGE MASTER
+    skip_set_readonly - If set, don't set read-only flag
     """
     conn = connect_mysql(slave_hostaddr)
     cursor = conn.cursor()
 
-    set_global_variable(slave_hostaddr, 'read_only', True)
+    if not skip_set_readonly:
+        set_global_variable(slave_hostaddr, 'read_only', True)
+
     reset_slave(slave_hostaddr)
     master_user, master_password = get_mysql_user_for_role('replication')
     parameters = {'master_user': master_user,
@@ -969,55 +1038,70 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
                                   set([CHECK_SQL_THREAD, CHECK_IO_THREAD]))
 
 
-def wait_replication_catch_up(slave_hostaddr):
-    """ Watch replication until it is caught up
+def wait_for_catch_up(slave_hostaddr, io=False, migration=False):
+    """ Watch replication or just the IO thread until it is caught up.
+    The default is to watch replication overall.
 
     Args:
     slave_hostaddr - A HostAddr object
+    io - if set, watch the IO thread only
+    migration - if set, we're running a migration, so skip some of
+                the expected-master sanity checks.
     """
-    last_sbm = None
-    catch_up_sbm = NORMAL_HEARTBEAT_LAG - HEARTBEAT_SAFETY_MARGIN
-    remaining_time = 'Not yet availible'
+    remaining_time = 'Not yet available'
     sleep_duration = 5
-
-    # Confirm that replication is setup at all
+    last = None
+    # Confirm that replication is even setup at all
     get_slave_status(slave_hostaddr)
 
     try:
-        assert_replication_sanity(slave_hostaddr)
+        assert_replication_sanity(slave_hostaddr, migration)
     except:
         log.warning('Replication does not appear sane, going to sleep 60 '
                     'seconds in case things get better on their own.')
         time.sleep(60)
-        assert_replication_sanity(slave_hostaddr)
+        assert_replication_sanity(slave_hostaddr, migration)
+
+    invalid_lag = ('{} is unavailable, going to sleep for a minute and '
+                   'retry. A likely reason is that there was a failover '
+                   'between when a backup was taken and when a restore was '
+                   'run so there will not be a entry until replication has '
+                   'caught up more. If this is a new replica set, read_only '
+                   'is probably ON on the master server.')
+    acceptable_lag = ('{lag_type}: {current_lag} < {normal_lag}, '
+                      'which is good enough.')
+    eta_catchup_time = ('{lag_type}: {current_lag}.  Waiting for < '
+                        '{normal_lag}.  Guestimate time to catch up: {eta}')
+
+    if io:
+        normal_lag = NORMAL_IO_LAG
+        lag_type = 'IO thread lag (bytes)'
+    else:
+        normal_lag = NORMAL_HEARTBEAT_LAG - HEARTBEAT_SAFETY_MARGIN
+        lag_type = 'Computed seconds behind master'
 
     while True:
         replication = calc_slave_lag(slave_hostaddr)
+        lag = replication['io_bytes'] if io else replication['sbm']
 
-        if replication['sbm'] is None or replication['sbm'] == INVALID:
-            log.info('Computed seconds behind master is unavailable, going to '
-                     'sleep for a minute and retry. A likely reason is that '
-                     'there was a failover between when a backup was taken '
-                     'and when a restore was run so there will not be a '
-                     'entry until replication has caught up more. If this is '
-                     'a new replica set, read_only is probably ON on the '
-                     'master server.')
+        if lag is None or lag == INVALID:
+            log.info(invalid_lag.format(lag_type))
             time.sleep(60)
             continue
 
-        if replication['sbm'] < catch_up_sbm:
-            log.info('Replication computed seconds behind master {sbm} < '
-                     '{catch_up_sbm}, which is "good enough".'
-                     ''.format(sbm=replication['sbm'],
-                               catch_up_sbm=catch_up_sbm))
+        if lag < normal_lag:
+            log.info(acceptable_lag.format(lag_type=lag_type,
+                                           current_lag=lag,
+                                           normal_lag=normal_lag))
             return
 
-        # last_sbm is set at the end of the first execution and should always
+        # last is set at the end of the first execution and should always
         # be set from then on
-        if last_sbm:
-            catch_up_rate = (last_sbm - replication['sbm']) / float(sleep_duration)
+        if last:
+            catch_up_rate = (last - lag) / float(sleep_duration)
             if catch_up_rate > 0:
-                remaining_time = datetime.timedelta(seconds=((replication['sbm'] - catch_up_sbm) / catch_up_rate))
+                remaining_time = datetime.timedelta(
+                    seconds=((lag - normal_lag) / catch_up_rate))
                 if remaining_time.total_seconds() > 6 * 60 * 60:
                     sleep_duration = 5 * 60
                 elif remaining_time.total_seconds() > 60 * 60:
@@ -1027,17 +1111,15 @@ def wait_replication_catch_up(slave_hostaddr):
             else:
                 remaining_time = '> heat death of the universe'
                 sleep_duration = 60
-            log.info('Replication is lagged by {sbm} seconds, waiting '
-                     'for < {catch_up}. Guestimate time to catch up: {eta}'
-                     ''.format(sbm=replication['sbm'],
-                               catch_up=catch_up_sbm,
-                               eta=str(remaining_time)))
         else:
-            # first time through
-            log.info('Replication is lagged by {sbm} seconds.'
-                     ''.format(sbm=replication['sbm']))
+            remaining_time = 'Not yet available'
 
-        last_sbm = replication['sbm']
+        log.info(eta_catchup_time.format(lag_type=lag_type,
+                                         current_lag=lag,
+                                         normal_lag=normal_lag,
+                                         eta=str(remaining_time)))
+
+        last = lag
         time.sleep(sleep_duration)
 
 
@@ -1086,12 +1168,16 @@ def assert_replication_unlagged(instance, lag_tolerance, dead_master=False):
 
 
 def assert_replication_sanity(instance,
+                              migration=False,
                               checks=ALL_REPLICATION_CHECKS):
     """ Confirm that a replica has replication running and from the correct
         source if the replica is in zk. If not, throw an exception.
 
     args:
     instance - A hostAddr object
+    migration - Set this to true if we're running a migration so that some
+                checks are skipped.
+    checks - A set of checks to run.
     """
     problems = set()
     slave_status = get_slave_status(instance)
@@ -1102,13 +1188,13 @@ def assert_replication_sanity(instance,
 
     if (CHECK_SQL_THREAD in checks and
             slave_status['Slave_SQL_Running'] != 'Yes'):
-        problems.add('Replcia {r} has SQL thread not running'
+        problems.add('Replica {r} has SQL thread not running'
                      ''.format(r=instance))
 
-    if CHECK_CORRECT_MASTER in checks:
+    if CHECK_CORRECT_MASTER in checks and not migration:
         zk = host_utils.MysqlZookeeper()
         try:
-            (replica_set, replica_type) = zk.get_replica_set_from_instance(instance)
+            replica_set = zk.get_replica_set_from_instance(instance)
         except:
             # must not be in zk, returning
             return
@@ -1120,7 +1206,6 @@ def assert_replication_sanity(instance,
                          'for replica {r}'.format(actual=actual_master,
                                                   expected=expected_master,
                                                   r=instance))
-
     if problems:
         raise Exception(', '.join(problems))
 
@@ -1433,7 +1518,7 @@ def get_mysqlops_connections():
     """
     (reporting_host, port, _, _) = mysql_connect.get_mysql_connection('mysqlopsdb001')
     reporting = host_utils.HostAddr(''.join((reporting_host, ':', str(port))))
-    return connect_mysql(reporting, 'scriptrw')
+    return connect_mysql(reporting, 'dbascript')
 
 
 def start_backup_log(instance, backup_type, timestamp):
@@ -1599,3 +1684,80 @@ def get_autoincrement_info_by_db(instance, db):
         ai_type = get_autoincrement_type(instance, db, table)
         ret[table] = (ai_type, ai_val)
     return ret
+
+
+def get_approx_schema_size(instance, db):
+    """ Get the approximate size of a db in MB
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+
+    Returns:
+        (float) Size in MB
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    sql = ("SELECT SUM(data_length + index_length)/1048576 as 'mb' "
+           "FROM information_schema.tables "
+           "WHERE table_schema=%(db)s")
+    cursor.execute(sql, {'db': db})
+
+    size = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return size['mb']
+
+
+def get_row_estimate(instance, db, table):
+    """ Get the approximate row count for a table.
+        This could be wildly inaccurate.
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+    table - the name of the table
+
+    Returns:
+        long: An estimated row count.
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    analyze = ("ANALYZE TABLE {db}.{table}"
+               "".format(db=db, table=table))
+    cursor.execute(analyze)
+
+    query = ("EXPLAIN SELECT COUNT(*) FROM {db}.{table}"
+             "".format(db=db, table=table))
+    cursor.execute(query)
+
+    estimation = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return estimation['rows']
+
+
+def get_row_count(instance, db, table):
+    """ Get the actual row count for a table
+
+    Args:
+    instance - a hostAddr object
+    db - a string which contains a name of a db
+    table - the name of the table
+
+    Returns:
+        long: An actual row count for the table
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    query = ("SELECT COUNT(*) AS 'rows' FROM {db}.{table}"
+             "".format(db=db, table=table))
+    cursor.execute(query)
+
+    count = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return count['rows']

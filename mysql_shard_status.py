@@ -14,8 +14,7 @@ def main():
     instance = host_utils.HostAddr(args.instance)
 
     zk = host_utils.MysqlZookeeper()
-    (_, replica_type) = zk.get_replica_set_from_instance(instance)
-
+    replica_type = zk.get_replica_type_from_instance(instance)
     print replica_type
 
 

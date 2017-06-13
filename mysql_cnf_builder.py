@@ -33,7 +33,9 @@ PT_KILL_BUSY_TIME = 10
 PT_KILL_TEMPLATE = 'pt_kill.template'
 PT_KILL_CONF_FILE = '/etc/pt-kill.conf'
 PT_KILL_IGNORE_USERS = ['admin', 'etl', 'longqueryro', 'longqueryrw',
-                        'pbuser', 'mysqldump', 'xtrabackup', 'ptchecksum']
+                        'pbuser', 'mysqldump', 'xtrabackup', 'ptchecksum',
+                        'dbascript']
+
 REMOVE_SETTING_PREFIX = 'remove_'
 READ_ONLY_OFF = 'OFF'
 READ_ONLY_ON = 'ON'
@@ -83,8 +85,8 @@ def build_cnf(host=None,
     # There are situations where we don't want to overwrite the
     # existing config file, because we are testing, etc...
     if os.path.isfile(TOUCH_FOR_NO_CONFIG_OVERWRITE):
-        log.info('Found {path}.  Will not overwrite anything.\n'
-                 'Exiting now.'.format(path=TOUCH_FOR_NO_CONFIG_OVERWRITE))
+        log.info('Found {}.  Will not overwrite anything.\n'
+                 'Exiting now.'.format(TOUCH_FOR_NO_CONFIG_OVERWRITE))
         return
 
     if not host:
@@ -97,7 +99,7 @@ def build_cnf(host=None,
 
     if major_version not in environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS:
         log.info('CNF building is not supported in '
-                 '{major_version}'.format(major_version=major_version))
+                 '{}'.format(major_version))
         return
 
     config_files = list()
@@ -122,23 +124,23 @@ def build_cnf(host=None,
 
     log.info('Hostname "{hostname}" results in hostname prefix "{prefix}"'
              ''.format(hostname=host.hostname,
-                       prefix=host.replica_type))
+                       prefix=host.hostname_prefix))
     config_files.append(os.path.join(RELATIVE_DIR, host.replica_type))
 
     # Using the config files, setup a config file parser
-    log.info('Using config files {files}'.format(files=config_files))
+    log.info('Using config files {}'.format(config_files))
     parser.read(config_files)
 
     # Set the server server_id based upon hostname
     server_id = hostname_to_server_id(host.hostname)
-    log.info('Setting server_id to {server_id}'.format(server_id=server_id))
+    log.info('Setting server_id to {}'.format(server_id))
     parser.set(MYSQLD_SECTION, 'server_id', server_id)
 
     # Set read_only based upon service discovery
     parser.set(MYSQLD_SECTION, 'read_only', config_read_only(host))
 
     # If needed, turn on safe updates via an init_file
-    create_init_sql(host.replica_type, parser, override_dir)
+    create_init_sql(host.hostname_prefix, parser, override_dir)
 
     # Set the hostname and root volume through the config
     replace_config_tag(parser, HOSTNAME_TAG, host.hostname)
@@ -198,14 +200,14 @@ def config_read_only(host):
     """ Determine how read_only should be set in the cnf file
 
     Args:
-    host - a hostaddr object
+        host - a hostaddr object
 
     Returns:
-    The string value of READ_ONLY_OFF or READ_ONLY_ON.
+        The string value of READ_ONLY_OFF or READ_ONLY_ON.
     """
     zk = host_utils.MysqlZookeeper()
     try:
-        (_, replica_type) = zk.get_replica_set_from_instance(host)
+        replica_type = zk.get_replica_type_from_instance(host)
     except:
         # If it is not in zk OR there is any other error, the safest thing is
         # to treat it as if it was not in zk and therefore read_only set to ON

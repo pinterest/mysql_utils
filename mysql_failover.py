@@ -1,20 +1,23 @@
 #!/usr/bin/env python
 import argparse
+import logging
 import os
 import time
 import uuid
-
 import MySQLdb
 
 import launch_replacement_db_host
 import modify_mysql_zk
+import fence_server
 from lib import mysql_lib
 from lib import host_utils
 from lib import environment_specific
 
 MAX_ZK_WRITE_ATTEMPTS = 5
+MAX_FENCE_ATTEMPTS = 2
 WAIT_TIME_CONFIRM_QUIESCE = 10
 
+log = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -26,7 +29,7 @@ def main():
                         default=False,
                         action='store_true')
     parser.add_argument('--ignore_dr_slave',
-                        help=('Need to promote, but alreaedy have a dead '
+                        help=('Need to promote, but already have a dead '
                               'dr_slave? This option is what you looking '
                               'for. The dr_slave will be completely '
                               'ignored.'),
@@ -43,14 +46,15 @@ def main():
                         action='store_true')
     parser.add_argument('--kill_old_master',
                         help=('If we can not get the master into read_only, '
-                              ' send a mysqladmin kill to the old master.'),
+                              'send a mysqladmin kill to the old master.'),
                         default=False,
                         action='store_true')
     args = parser.parse_args()
 
     instance = host_utils.HostAddr(args.instance)
     mysql_failover(instance, args.dry_run, args.skip_lock,
-                   args.ignore_dr_slave, args.trust_me_its_dead, args.kill_old_master)
+                   args.ignore_dr_slave, args.trust_me_its_dead,
+                   args.kill_old_master)
 
 
 def mysql_failover(master, dry_run, skip_lock,
@@ -68,12 +72,14 @@ def mysql_failover(master, dry_run, skip_lock,
     Returns:
     new_master - The new master server
     """
-    log.info('Master to demote is {master}'.format(master=master))
+    log.info('Master to demote is {}'.format(master))
 
     zk = host_utils.MysqlZookeeper()
-    (replica_set, _) = zk.get_replica_set_from_instance(master, rtypes=['master'])
-    log.info('Replica set is detected as '
-             '{replica_set}'.format(replica_set=replica_set))
+    if zk.get_replica_type_from_instance(master) != host_utils.REPLICA_ROLE_MASTER:
+        raise Exception('Instance {} is not a master'.format(master))
+
+    replica_set = zk.get_replica_set_from_instance(master)
+    log.info('Replica set is detected as {}'.format(replica_set))
 
     # take a lock here to make sure nothing changes underneath us
     if not skip_lock and not dry_run:
@@ -87,7 +93,7 @@ def mysql_failover(master, dry_run, skip_lock,
         master_conn = False
         slave = zk.get_mysql_instance_from_replica_set(replica_set=replica_set,
                                                        repl_type=host_utils.REPLICA_ROLE_SLAVE)
-        log.info('Slave/new master is detected as {slave}'.format(slave=slave))
+        log.info('Slave/new master is detected as {}'.format(slave))
 
         if ignore_dr_slave:
             log.info('Intentionally ignoring a dr_slave')
@@ -95,7 +101,7 @@ def mysql_failover(master, dry_run, skip_lock,
         else:
             dr_slave = zk.get_mysql_instance_from_replica_set(replica_set,
                                                               host_utils.REPLICA_ROLE_DR_SLAVE)
-        log.info('DR slave is detected as {dr_slave}'.format(dr_slave=dr_slave))
+        log.info('DR slave is detected as {}'.format(dr_slave))
         if dr_slave:
             if dr_slave == slave:
                 raise Exception('Slave and dr_slave appear to be the same')
@@ -163,10 +169,9 @@ def mysql_failover(master, dry_run, skip_lock,
             log.info('Starting up a zk connection to make sure we can connect')
             kazoo_client = environment_specific.get_kazoo_client()
             if not kazoo_client:
-                raise Exception('Could not conect to zk')
+                raise Exception('Could not connect to zk')
 
-            log.info('Confirming replica has processed all replication '
-                     ' logs')
+            log.info('Confirming replica has processed all replication logs')
             confirm_no_writes(slave)
             log.info('Looks like no writes being processed by replica via '
                      'replication or other means')
@@ -210,12 +215,19 @@ def mysql_failover(master, dry_run, skip_lock,
                 raise
             else:
                 log.info('Write to zk failed, trying again')
-                zk_write_attempt = zk_write_attempt+1
+                zk_write_attempt = zk_write_attempt + 1
 
     log.info('Removing read_only from new master')
     mysql_lib.set_global_variable(slave, 'read_only', False)
     log.info('Removing replication configuration from new master')
     mysql_lib.reset_slave(slave)
+    # fence dead server
+    if dead_master:
+                # for some weird case when local config file is not
+                # updated with new zk config but the old master is dead
+                # already we simply FORCE-fence it here
+        fence_server.add_fence_to_host(master, dry_run, force=True)
+          
     if lock_identifier:
         log.info('Releasing promotion lock')
         release_promotion_lock(lock_identifier)
@@ -514,5 +526,5 @@ def confirm_replicas_in_sync(replicas):
 
 
 if __name__ == "__main__":
-    log = environment_specific.setup_logging_defaults(__name__)
+    environment_specific.initialize_logger()
     main()

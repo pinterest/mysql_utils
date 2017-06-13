@@ -72,6 +72,13 @@ def main():
                         help='Use the dev bucket, useful for testing')
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None))
+
+    # Nope, don't even start.
+    if os.path.isfile(backup.CSV_BACKUP_SKIP_FILE):
+        log.info('Found {}. Skipping CSV backup '
+                 'run.'.format(backup.CSV_BACKUP_SKIP_FILE))
+        return
+
     # If we ever want to run multi instance, this wil need to be updated
     backup_obj = mysql_backup_csv(host_utils.HostAddr(host_utils.HOSTNAME),
                                   args.db, args.force_table,
@@ -95,80 +102,81 @@ class mysql_backup_csv:
         self.instance = instance
         self.timestamp = datetime.datetime.utcnow()
         # datestamp is for s3 files which are by convention -1 day
-        self.datestamp = (self.timestamp - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        self.datestamp = (self.timestamp -
+                          datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         self.dbs_to_backup = multiprocessing.Queue()
         if db:
             self.dbs_to_backup.put(db)
         else:
-            for db in mysql_lib.get_dbs(self.instance):
+            for db in self.get_dbs_to_backup():
                 self.dbs_to_backup.put(db)
 
+        self.dev_bucket = dev_bucket
         self.force_table = force_table
         self.force_reupload = force_reupload
-        if dev_bucket:
-            self.upload_bucket = environment_specific.S3_CSV_BUCKET_DEV
-        else:
-            self.upload_bucket = environment_specific.S3_CSV_BUCKET
+        self.upload_bucket = environment_specific.S3_CSV_BUCKET_DEV \
+            if dev_bucket else environment_specific.S3_CSV_BUCKET
 
     def backup_instance(self):
         """ Back up a replica instance to s3 in csv """
-        host_lock_handle = None
-        try:
-            log.info('Backup for instance {i} started at {t}'
-                     ''.format(t=str(self.timestamp),
-                               i=self.instance))
-            log.info('Checking heartbeat to make sure replicaiton is not too '
-                     'lagged.')
-            self.check_replication_for_backup()
 
-            log.info('Taking host backup lock')
-            host_lock_handle = host_utils.take_flock_lock(backup.BACKUP_LOCK_FILE)
+        log.info('Backup for instance {i} started at {t}'
+                 ''.format(t=str(self.timestamp),
+                           i=self.instance))
+        log.info('Checking heartbeat to make sure replication is not too '
+                 'lagged.')
+        self.check_replication_for_backup()
 
-            log.info('Setting up export directory structure')
-            self.setup_and_get_tmp_path()
-            log.info('Will temporarily dump inside of {path}'
-                     ''.format(path=self.dump_base_path))
+        log.info('Taking host backup lock')
+        host_lock = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
 
-            log.info('Releasing any invalid shard backup locks')
-            self.ensure_backup_locks_sanity()
+        log.info('Setting up export directory structure')
+        self.setup_and_get_tmp_path()
+        log.info('Will temporarily dump inside of {path}'
+                 ''.format(path=self.dump_base_path))
 
-            log.info('Deleting old expired locks')
-            self.purge_old_expired_locks()
+        log.info('Releasing any invalid shard backup locks')
+        self.ensure_backup_locks_sanity()
 
-            log.info('Stopping replication SQL thread to get a snapshot')
-            mysql_lib.stop_replication(self.instance, mysql_lib.REPLICATION_THREAD_SQL)
+        log.info('Deleting old expired locks')
+        self.purge_old_expired_locks()
 
-            workers = []
-            for _ in range(multiprocessing.cpu_count() / 2):
-                proc = multiprocessing.Process(target=self.mysql_backup_csv_dbs)
-                proc.daemon = True
-                proc.start()
-                workers.append(proc)
-            # throw in a sleep to make sure all threads have started dumps
-            time.sleep(2)
-            log.info('Restarting replication')
-            mysql_lib.start_replication(self.instance, mysql_lib.REPLICATION_THREAD_SQL)
+        log.info('Stopping replication SQL thread to get a snapshot')
+        mysql_lib.stop_replication(self.instance,
+                                   mysql_lib.REPLICATION_THREAD_SQL)
 
-            for worker in workers:
-                worker.join()
+        workers = []
+        for _ in range(multiprocessing.cpu_count() / 2):
+            proc = multiprocessing.Process(target=self.mysql_backup_csv_dbs)
+            proc.daemon = True
+            proc.start()
+            workers.append(proc)
 
-            if not self.dbs_to_backup.empty():
-                raise Exception('All worker processes have completed, but '
-                                'work remains in the queue')
+        # throw in a sleep to make sure all threads have started dumps
+        time.sleep(2)
+        log.info('Restarting replication')
+        mysql_lib.start_replication(self.instance,
+                                    mysql_lib.REPLICATION_THREAD_SQL)
 
-            log.info('CSV backup is complete, will run a check')
-            mysql_backup_status.verify_csv_backup(self.instance.replica_type,
-                                                  self.datestamp,
-                                                  self.instance)
-        finally:
-            if host_lock_handle:
-                log.info('Releasing general host backup lock')
-                host_utils.release_flock_lock(host_lock_handle)
+        for worker in workers:
+            worker.join()
+
+        if not self.dbs_to_backup.empty():
+            raise Exception('All worker processes have completed, but '
+                            'work remains in the queue')
+
+        log.info('CSV backup is complete, will run a check')
+        mysql_backup_status.verify_csv_instance_backup(
+            self.instance,
+            self.datestamp,
+            self.dev_bucket)
+        host_utils.release_lock_socket(host_lock)
 
     def mysql_backup_csv_dbs(self):
         """ Worker for backing up a queue of dbs """
         proc_id = multiprocessing.current_process().name
-        conn = mysql_lib.connect_mysql(self.instance, backup.USER_ROLE_MYSQLDUMP)
+        conn = mysql_lib.connect_mysql(self.instance,
+                    backup.USER_ROLE_MYSQLDUMP)
         mysql_lib.start_consistent_snapshot(conn, read_only=True)
         pitr_data = mysql_lib.get_pitr_data(self.instance)
         err_count = 0
@@ -184,8 +192,8 @@ class mysql_backup_csv:
                                               proc_id=proc_id))
                 err_count = err_count + 1
                 if err_count > MAX_THREAD_ERROR:
-                    log.error('{proc_id}: Error count in thread > MAX_THREAD_ERROR. '
-                              'Aborting :('.format(proc_id=proc_id))
+                    log.error('{}: Error count in thread > MAX_THREAD_ERROR. '
+                              'Aborting :('.format(proc_id))
                     return
 
     def mysql_backup_csv_db(self, db, conn, pitr_data):
@@ -211,9 +219,9 @@ class mysql_backup_csv:
             self.release_expired_locks()
             lock_identifier = self.take_backup_lock(db)
             extend_lock_stop_event = threading.Event()
-            extend_lock_thread = threading.Thread(target=self.extend_backup_lock,
-                                                  args=(lock_identifier,
-                                                        extend_lock_stop_event))
+            extend_lock_thread = threading.Thread(
+                    target=self.extend_backup_lock,
+                    args=(lock_identifier, extend_lock_stop_event))
             extend_lock_thread.daemon = True
             extend_lock_thread.start()
             if not lock_identifier:
@@ -259,10 +267,8 @@ class mysql_backup_csv:
         conn - a connection the the mysql instance
         """
         proc_id = multiprocessing.current_process().name
-        (_, data_path, _) = environment_specific.get_csv_backup_paths(
-                                self.datestamp, db, table,
-                                self.instance.replica_type,
-                                self.instance.get_zk_replica_set()[0])
+        (_, data_path, _) = backup.get_csv_backup_paths(self.instance, db,
+                                table, self.datestamp)
         log.debug('{proc_id}: {db}.{table} dump to {path} started'
                   ''.format(proc_id=proc_id,
                             db=db,
@@ -288,8 +294,8 @@ class mysql_backup_csv:
             # Start dump query
             return_value = set()
             query_thread = threading.Thread(target=self.run_dump_query,
-                                            args=(db, table, fifo,
-                                                  conn, procs['cat'], return_value))
+                                            args=(db, table, fifo, conn,
+                                                  procs['cat'], return_value))
             query_thread.daemon = True
             query_thread.start()
 
@@ -306,13 +312,12 @@ class mysql_backup_csv:
                                 db=db,
                                 table=table))
         except:
-            log.debug('{proc_id}: in exception handling for failed table upload'
-                      ''.format(proc_id=proc_id))
+            log.debug('{}: in exception handling for failed table '
+                      'upload'.format(proc_id))
 
             if os.path.exists(fifo):
                 self.cleanup_fifo(fifo)
 
-            safe_uploader.kill_precursor_procs(procs)
             raise
 
     def create_fifo(self, fifo):
@@ -340,7 +345,7 @@ class mysql_backup_csv:
         log.debug('{proc_id}: Cleanup of {fifo} started'
                   ''.format(proc_id=multiprocessing.current_process().name,
                             fifo=fifo))
-        cat_proc = subprocess.Popen('timeout 5 cat {fifo} >/dev/null'.format(fifo=fifo),
+        cat_proc = subprocess.Popen('timeout 5 cat {} >/dev/null'.format(fifo),
                                     shell=True)
         cat_proc.wait()
         os.remove(fifo)
@@ -381,8 +386,9 @@ class mysql_backup_csv:
             if psutil.pid_exists(cat_proc.pid):
                 cat_proc.kill()
             log.error('{proc_id}: dump query encountered an error: {er}'
-                      ''.format(er=detail,
-                                proc_id=multiprocessing.current_process().name))
+                      ''.format(
+                        er=detail,
+                        proc_id=multiprocessing.current_process().name))
 
         log.debug('{proc_id}: {db}.{table} dump complete'
                   ''.format(proc_id=multiprocessing.current_process().name,
@@ -398,8 +404,8 @@ class mysql_backup_csv:
                         the query succeeded
         """
         if SUCCESS_ENTRY not in return_value:
-            raise Exception('{proc_id}: dump failed'
-                            ''.format(proc_id=multiprocessing.current_process().name))
+            raise Exception('{}: dump failed'
+                            ''.format(multiprocessing.current_process().name))
 
     def upload_pitr_data(self, db, pitr_data):
         """ Upload a file of PITR data to s3 for each schema
@@ -409,7 +415,9 @@ class mysql_backup_csv:
         pitr_data - a dict of various data that might be helpful for running a
                     PITR
         """
-        s3_path = PATH_PITR_DATA.format(replica_set=self.instance.get_zk_replica_set()[0],
+        zk = host_utils.MysqlZookeeper()
+        replica_set = zk.get_replica_set_from_instance(self.instance)
+        s3_path = PATH_PITR_DATA.format(replica_set=replica_set,
                                         date=self.datestamp,
                                         db_name=db)
         log.debug('{proc_id}: {db} Uploading pitr data to {s3_path}'
@@ -429,10 +437,8 @@ class mysql_backup_csv:
         table - the table to be backed up
         tmp_dir_db - temporary storage used for all tables in the db
         """
-        (schema_path, _, _) = environment_specific.get_csv_backup_paths(
-                                     self.datestamp, db, table,
-                                     self.instance.replica_type,
-                                     self.instance.get_zk_replica_set()[0])
+        (schema_path, _, _) = backup.get_csv_backup_paths(
+                                    self.instance, db, table, self.datestamp)
         create_stm = mysql_lib.show_create_table(self.instance, db, table)
         log.debug('{proc_id}: Uploading schema to {schema_path}'
                   ''.format(schema_path=schema_path,
@@ -452,10 +458,11 @@ class mysql_backup_csv:
         a uuid lock identifier
         """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = self.instance.get_zk_replica_set()
-        master = zk.get_mysql_instance_from_replica_set(replica_set,
-                                                        host_utils.REPLICA_ROLE_MASTER)
-        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        replica_set = zk.get_replica_set_from_instance(self.instance)
+        master = zk.get_mysql_instance_from_replica_set(
+                    replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='dbascript')
         cursor = master_conn.cursor()
 
         lock_identifier = str(uuid.uuid4())
@@ -496,7 +503,7 @@ class mysql_backup_csv:
             cursor.execute(sql,
                            {'db': db, 'active': ACTIVE})
             ret = cursor.fetchone()
-            log.debug('DB {db} is already being backed up on {hostname}:{port}, '
+            log.debug('DB {db} is being backed up on {hostname}:{port}, '
                       'lock will expire at {expires}.'
                       ''.format(db=db,
                                 hostname=ret['hostname'],
@@ -520,9 +527,10 @@ class mysql_backup_csv:
         while(not extend_lock_stop_event.is_set()):
             if (time.time() - last_update) > LOCK_EXTEND_FREQUENCY:
                 zk = host_utils.MysqlZookeeper()
-                (replica_set, _) = self.instance.get_zk_replica_set()
-                master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
-                master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+                replica_set = zk.get_replica_set_from_instance(self.instance)
+                master = zk.get_mysql_instance_from_replica_set(replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+                master_conn = mysql_lib.connect_mysql(master, role='dbascript')
                 cursor = master_conn.cursor()
 
                 params = {'lock_identifier': lock_identifier}
@@ -545,9 +553,10 @@ class mysql_backup_csv:
         lock_identifier - a uuid to identify a lock row
         """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = self.instance.get_zk_replica_set()
-        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
-        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        replica_set = zk.get_replica_set_from_instance(self.instance)
+        master = zk.get_mysql_instance_from_replica_set(replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='dbascript')
         cursor = master_conn.cursor()
 
         params = {'lock_identifier': lock_identifier}
@@ -563,20 +572,22 @@ class mysql_backup_csv:
 
     def ensure_backup_locks_sanity(self):
         """ Release any backup locks that aren't sane. This means locks
-            created by the same host as the caller. The instance level flock
+            created by the same host as the caller. The instance level lock
             should allow this assumption to be correct.
         """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = self.instance.get_zk_replica_set()
-        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
-        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        replica_set = zk.get_replica_set_from_instance(self.instance)
+        master = zk.get_mysql_instance_from_replica_set(replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='dbascript')
         cursor = master_conn.cursor()
 
         if not mysql_lib.does_table_exist(master, mysql_lib.METADATA_DB,
                                           CSV_BACKUP_LOCK_TABLE_NAME):
             log.debug('Creating missing metadata table')
-            cursor.execute(CSV_BACKUP_LOCK_TABLE.format(db=mysql_lib.METADATA_DB,
-                                                        tbl=CSV_BACKUP_LOCK_TABLE_NAME))
+            cursor.execute(CSV_BACKUP_LOCK_TABLE.format(
+                    db=mysql_lib.METADATA_DB,
+                    tbl=CSV_BACKUP_LOCK_TABLE_NAME))
 
         params = {'hostname': self.instance.hostname,
                   'port': self.instance.port}
@@ -592,9 +603,10 @@ class mysql_backup_csv:
     def release_expired_locks(self):
         """ Release any expired locks """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = self.instance.get_zk_replica_set()
-        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
-        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        replica_set = zk.get_replica_set_from_instance(self.instance)
+        master = zk.get_mysql_instance_from_replica_set(replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='dbascript')
         cursor = master_conn.cursor()
 
         sql = ('UPDATE {db}.{tbl} '
@@ -609,9 +621,10 @@ class mysql_backup_csv:
     def purge_old_expired_locks(self):
         """ Delete any locks older than a week """
         zk = host_utils.MysqlZookeeper()
-        (replica_set, _) = self.instance.get_zk_replica_set()
-        master = zk.get_mysql_instance_from_replica_set(replica_set, host_utils.REPLICA_ROLE_MASTER)
-        master_conn = mysql_lib.connect_mysql(master, role='scriptrw')
+        replica_set = zk.get_replica_set_from_instance(self.instance)
+        master = zk.get_mysql_instance_from_replica_set(replica_set,
+                    host_utils.REPLICA_ROLE_MASTER)
+        master_conn = mysql_lib.connect_mysql(master, role='dbascript')
         cursor = master_conn.cursor()
 
         sql = ('DELETE FROM {db}.{tbl} '
@@ -635,13 +648,25 @@ class mysql_backup_csv:
         boto_conn = boto.connect_s3()
         bucket = boto_conn.get_bucket(self.upload_bucket, validate=False)
         for table in self.get_tables_to_backup(db):
-            (_, data_path, _) = environment_specific.get_csv_backup_paths(
-                                           self.datestamp, db, table,
-                                           self.instance.replica_type,
-                                           self.instance.get_zk_replica_set()[0])
+            (_, data_path, _) = backup.get_csv_backup_paths(self.instance,
+                                           db, table, self.datestamp)
             if not bucket.get_key(data_path):
                 return False
         return True
+
+    def get_dbs_to_backup(self):
+        """ Determine which tables should be backed up in an instance
+
+        Returns:
+            a set of dbs
+        """
+        zk = host_utils.MysqlZookeeper()
+        rs = zk.get_replica_set_from_instance(self.instance)
+        dbs = zk.get_sharded_dbs_by_replica_set()[rs]
+        if dbs:
+            return dbs
+        else:
+            return mysql_lib.get_dbs(self.instance)
 
     def get_tables_to_backup(self, db):
         """ Determine which tables should be backed up in a db
@@ -652,15 +677,15 @@ class mysql_backup_csv:
         Returns:
         a set of table names
         """
-        tables = environment_specific.filter_tables_to_csv_backup(
+        tables = backup.filter_tables_to_csv_backup(
                      self.instance, db,
                      mysql_lib.get_tables(self.instance, db, skip_views=True))
         if not self.force_table:
             return tables
 
         if self.force_table not in tables:
-            raise Exception('Requested table {t} is not available to backup'
-                            ''.format(t=self.force_table))
+            raise Exception('Requested table {} is not available to backup'
+                            ''.format(self.force_table))
         else:
             return set([self.force_table])
 
@@ -669,14 +694,14 @@ class mysql_backup_csv:
         while True:
             heartbeat = mysql_lib.get_heartbeat(self.instance)
             if heartbeat.date() < self.timestamp.date():
-                log.warning('Replicaiton is too lagged ({cur}) to run daily backup, '
-                            'sleeping'.format(cur=heartbeat))
+                log.warning('Replication is too lagged ({}) to run daily '
+                            'backup, sleeping'.format(heartbeat))
                 time.sleep(10)
             elif heartbeat.date() > self.timestamp.date():
                 raise Exception('Replication is later than expected day')
             else:
-                log.info('Replicaiton is ok ({cur}) to run daily backup'
-                         ''.format(cur=heartbeat))
+                log.info('Replication is ok ({}) to run daily '
+                         'backup'.format(heartbeat))
                 return
 
     def setup_and_get_tmp_path(self):
@@ -690,6 +715,7 @@ class mysql_backup_csv:
             os.makedirs(tmp_dir_root)
         host_utils.change_owner(tmp_dir_root, 'mysql', 'mysql')
         self.dump_base_path = tmp_dir_root
+
 
 if __name__ == "__main__":
     environment_specific.initialize_logger()

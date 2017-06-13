@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+
 import argparse
 import glob
 import logging
@@ -45,7 +46,8 @@ def log_table_sizes(port):
     """
     instance = host_utils.HostAddr(':'.join((host_utils.HOSTNAME, port)))
     zk = host_utils.MysqlZookeeper()
-    replica_set = instance.get_zk_replica_set()[0]
+
+    replica_set = zk.get_replica_set_from_instance(instance)
     master = zk.get_mysql_instance_from_replica_set(replica_set,
                                                     host_utils.REPLICA_ROLE_MASTER)
     if not mysql_lib.does_table_exist(master,
@@ -54,7 +56,7 @@ def log_table_sizes(port):
         create_table_size_table(master)
 
     sizes = get_all_table_sizes(instance)
-    conn = mysql_lib.connect_mysql(master, 'scriptrw')
+    conn = mysql_lib.connect_mysql(master, 'dbascript')
     for db in sizes:
         for table in sizes[db]:
             for partition in sizes[db][table]:
@@ -81,13 +83,45 @@ def log_table_sizes(port):
                 cursor.close()
 
 
+def get_db_size_from_log(instance, db):
+    """ Get yesterdays db size for an instance
+
+    Args:
+    instance - A hostaddr object
+    db - A database that exists on the instance
+
+    Returns: size in MB
+    """
+    conn = mysql_lib.connect_mysql(instance, 'dbascript')
+    cursor = conn.cursor()
+    sql = ("SELECT SUM(size_mb) as 'mb', "
+           "        COUNT(1) as 'table_count' "
+           "FROM  {metadata_db}.{tbl} "
+           "WHERE db = %(db)s "
+           "    AND reported_at=CURDATE() - INTERVAL 1 DAY "
+           "    AND hostname=%(hostname)s and port=%(port)s "
+           "GROUP BY db;")
+    params = {'hostname': instance.hostname,
+              'port': instance.port,
+              'db': db}
+    cursor.execute(sql.format(metadata_db=mysql_lib.METADATA_DB,
+                              tbl=TABLE_SIZE_TBL), params)
+    ret = cursor.fetchone()
+
+    expected_tables = mysql_lib.get_tables(instance, db, skip_views=True)
+    if ret['table_count'] != len(expected_tables):
+        raise Exception('Size data appears to be missing for {db} on {inst}'
+                        ''.format(db=db, inst=instance))
+    return ret['mb']
+
+
 def create_table_size_table(instance):
     """ Create the table_size_historic table
 
     Args:
     a hostAddr object for the master of the replica set
     """
-    conn = mysql_lib.connect_mysql(instance, 'scriptrw')
+    conn = mysql_lib.connect_mysql(instance, 'dbascript')
     cursor = conn.cursor()
     cursor.execute(TABLE_DEF.format(db=mysql_lib.METADATA_DB,
                    tbl=TABLE_SIZE_TBL))
@@ -112,7 +146,7 @@ def get_all_table_sizes(instance):
             (table, partition) = parse_table_file_name(table_path)
             if table not in ret[db]:
                 ret[db][table] = dict()
-            ret[db][table][partition] = os.stat(table_path).st_size/1024/1024
+            ret[db][table][partition] = os.stat(table_path).st_size / 1048576
 
     return ret
 

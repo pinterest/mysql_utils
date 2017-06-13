@@ -1,5 +1,7 @@
 import ConfigParser
-import fcntl
+import StringIO
+import boto3
+import getpass
 import json
 import multiprocessing
 import os
@@ -7,14 +9,11 @@ import pycurl
 import re
 import shutil
 import socket
-import StringIO
 import subprocess
 import time
-import getpass
 
 import mysql_lib
 from lib import environment_specific
-from lib import timeout
 
 ACCEPTABLE_ROOT_VOLUMES = ['/raid0', '/mnt']
 OLD_CONF_ROOT = '/etc/mysql/my-{port}.cnf'
@@ -32,6 +31,9 @@ MYSQL_NOREPL_CNF_FILE = '/etc/mysql/skip_slave_start.cnf'
 MYSQL_DS_ZK = '/var/config/config.services.dataservices.mysql_databases'
 MYSQL_DR_ZK = '/var/config/config.services.disaster_recoverydb'
 MYSQL_GEN_ZK = '/var/config/config.services.general_mysql_databases_config'
+MYSQL_SHARD_MAP_ZK = '/var/config/config.services.generaldb.mysql_shards'
+MYSQL_SHARD_MAP_ZK_TEST = \
+    "/var/config/config.services.generaldb.test_mysql_shards"
 MYSQL_MAX_WAIT = 120
 MYSQL_STARTED = 0
 MYSQL_STOPPED = 1
@@ -52,44 +54,43 @@ SUPERVISOR_CMD = '/usr/local/bin/supervisorctl {action} mysql:mysqld-{port}'
 INIT_CMD = '/etc/init.d/mysqld_multi {options} {action} {port}'
 PTKILL_CMD = '/usr/sbin/service pt-kill-{port} {action}'
 PTHEARTBEAT_CMD = '/usr/sbin/service pt-heartbeat-{port} {action}'
+# Tcollector will restart automatically
+RESTART_TCOLLECTOR = '/usr/bin/pkill -f "/opt/tcollector/"'
 ZK_CACHE = [MYSQL_DS_ZK, MYSQL_DR_ZK, MYSQL_GEN_ZK]
 
 log = environment_specific.setup_logging_defaults(__name__)
 
 
-def take_flock_lock(file_name):
-    """ Take a flock for throw an exception
+def bind_lock_socket(lock_name='singleton'):
+    """ Create and bind an abstract socket with the specified name.
+        This is an alternative approach to flock-based locking which
+        needs no write permissions on the filesystem, automatically
+        cleans itself up upon process exit, and is root-proof.  If
+        the bind fails, we should exit the program immediately right
+        here, but we'll leave that to the caller and just raise an
+        exception.  !!LINUX ONLY!!
+
+        Args:
+            lock_name - a descriptive name for the socket
+        Returns:
+            The socket, if successful.
+    """
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind('\0' + lock_name)
+    return s
+
+
+def release_lock_socket(socket_handle):
+    """ There is one place where we need to release the lock and then
+        reacquire it, so being able to explicitly do so becomes useful.
 
     Args:
-    file_name - The name of the file to flock
-
+        socket_handle: A handle to the socket
     Returns:
-    file_handle - This will be passed to release_flock_lock for relase
+        Nothing
     """
-    success = False
-    try:
-        with timeout.timeout(1):
-            file_handle = open(file_name, 'w')
-            fcntl.flock(file_handle.fileno(), fcntl.LOCK_EX)
-            log.info('Lock taken')
-            success = True
-    except:
-        pass
-        # If success has not been set we will raise an exception just below
-
-    if not success:
-        raise Exception('Could not attain lock '
-                        'on {file_name}'.format(file_name=file_name))
-    return file_handle
-
-
-def release_flock_lock(file_handle):
-    """ Release a lock created by take_flock_lock
-
-    Args:
-    file_handle - The return from take_flock_lock()
-    """
-    fcntl.flock(file_handle.fileno(), fcntl.LOCK_UN)
+    socket_handle.close()
+    socket_handle = None
 
 
 def find_root_volume():
@@ -266,6 +267,12 @@ def restart_pt_kill(port):
     log.info(std_out.rstrip())
 
 
+def restart_tcollector():
+    log.info('Restart tcollector')
+    log.info(RESTART_TCOLLECTOR)
+    shell_exec(RESTART_TCOLLECTOR)
+
+
 def upgrade_auth_tables(port):
     """ Run mysql_upgrade
 
@@ -276,11 +283,11 @@ def upgrade_auth_tables(port):
                 DEFAULTS_FILE_ARG.format(defaults_file=MYSQL_UPGRADE_CNF_FILE))
     socket = get_cnf_setting('socket', port)
     username, password = mysql_lib.get_mysql_user_for_role('admin')
-    cmd = '' .join((MYSQL_UPGRADE, ' ',
-                    '--upgrade-system-tables ',
-                    '-S ', socket, ' ',
-                    '-u ', username, ' ',
-                    '-p', password))
+    cmd = ''.join((MYSQL_UPGRADE, ' ',
+                   '--upgrade-system-tables ',
+                   '-S ', socket, ' ',
+                   '-u ', username, ' ',
+                   '-p', password))
     log.info(cmd)
     (std_out, std_err, return_code) = shell_exec(cmd)
     log.info(std_out)
@@ -291,66 +298,218 @@ def upgrade_auth_tables(port):
     stop_mysql(port)
 
 
+_shard_map = None
+_shard_map_refresh = None
+_ds_map = None
+_ds_refresh = None
+_gen_map = None
+_gen_refresh = None
+_dr_map = None
+_dr_refresh = None
+_all_instances = dict()
+_instance_rs_map = dict()
+
+
 class MysqlZookeeper:
     """Class for reading MySQL settings stored on the filesystem"""
 
     def get_ds_mysql_config(self):
-        """ Query for Data Services MySQL shard mappings.
+        """ Query for Data Services MySQL replica set mappings.
 
         Returns:
         A dict of all Data Services MySQL replication configuration.
 
         Example:
         {u'db00001': {u'db': None,
-                  u'master': {u'host': u'sharddb001h',
+                  u'master': {u'host': u'sharddb-1-31',
                               u'port': 3306},
                   u'passwd': u'redacted',
-                  u'slave': {u'host': u'sharddb001i',
-                              u'port': 3306},
+                  u'slave': {u'host': u'sharddb-1-32',
+                             u'port': 3306},
                   u'user': u'pbuser'},
         ...
         """
-        with open(MYSQL_DS_ZK) as f:
-            ds = json.loads(f.read())
+        global _ds_map
+        global _ds_refresh
+        if _ds_map and (_ds_refresh > time.time() - 1):
+            return _ds_map
 
-        return ds
+        with open(MYSQL_DS_ZK) as f:
+            _ds_map = json.loads(f.read())
+            _ds_refresh = time.time()
+
+        return _ds_map
 
     def get_gen_mysql_config(self):
-        """ Query for non-Data Services MySQL shard mappings.
+        """ Query for non-Data Services MySQL replica set mappings.
 
         Returns:
         A dict of all non-Data Services MySQL replication configuration.
 
         Example:
         {u'abexperimentsdb001': {u'db': u'abexperimentsdb',
-                                 u'master': {u'host': u'abexperimentsdb001a',
+                                 u'master': {u'host': u'abexperimentsdb-1-1',
                                              u'port': 3306},
                                 u'passwd': u'redacted',
-                                u'slave': {u'host': u'abexperimentsdb001b',
+                                u'slave': {u'host': u'abexperimentsdb-12',
                                            u'port': 3306},
                                 u'user': u'redacted'},
         ...
         """
-        with open(MYSQL_GEN_ZK) as f:
-            gen = json.loads(f.read())
+        global _gen_map
+        global _gen_refresh
+        if _gen_map and (_gen_refresh > time.time() - 1):
+            return _gen_map
 
-        return gen
+        with open(MYSQL_GEN_ZK) as f:
+            _gen_map = json.loads(f.read())
+            _gen_refresh = time.time()
+
+        return _gen_map
 
     def get_dr_mysql_config(self):
-        """ Query for disaster recovery MySQL shard mappings.
+        """ Query for disaster recovery MySQL instance mappings.
 
         Returns:
         A dict of all MySQL disaster recovery instances.
 
         Example:
-        {u'db00018': {u'dr_slave': {u'host': u'sharddb018h', u'port': 3306}},
-         u'db00015': {u'dr_slave': {u'host': u'sharddb015g', u'port': 3306}},
+        {u'db00018': {u'dr_slave': {u'host': u'sharddb-18-33', u'port': 3306}},
+         u'db00015': {u'dr_slave': {u'host': u'sharddb-15-31', u'port': 3306}},
         ...
         """
-        with open(MYSQL_DR_ZK) as f:
-            dr = json.loads(f.read())
+        global _dr_map
+        global _dr_refresh
+        if _dr_map and (_dr_refresh > time.time() - 1):
+            return _dr_map
 
-        return dr
+        with open(MYSQL_DR_ZK) as f:
+            _dr_map = json.loads(f.read())
+            _dr_refresh = time.time()
+
+        return _dr_map
+
+    def get_sharded_services(self):
+        """ For sharded datasets
+
+        Returns:
+        A set of sharded services
+        """
+        s_map = self.get_zk_mysql_shard_map()
+        sharded_services = set()
+        for s in s_map['services']:
+            for ns in s_map['services'][s]['namespaces']:
+                # We store service discovery for java apps in the same place as
+                # our sharded datasets. So anything with just one shard we
+                # will just ignore
+                if len(s_map['services'][s]['namespaces'][ns]['shards']) > 1:
+                    sharded_services.add(s)
+        return sharded_services
+
+    def get_sharded_types(self):
+        """ For sharded datasets
+
+        Returns:
+        A set of sharded types (not to be confused with replica types)
+
+        Note: This isn't that different from the previous function, except
+        that the previous function returns service-level descriptions
+        and this one includes namespace data where present.
+        """
+        s_map = self.get_zk_mysql_shard_map()
+        sharded_db_types = set()
+        for s in s_map['services']:
+            for ns in s_map['services'][s]['namespaces']:
+                # We store service discovery for java apps in the same place as
+                # our sharded datasets. So anything with just one shard we
+                # will just ignore
+                if len(s_map['services'][s]['namespaces'][ns]['shards']) > 1:
+                    if ns == '':
+                        sharded_db_types.add(s)
+                    else:
+                        sharded_db_types.add('_'.join([s, ns]))
+        return sharded_db_types
+
+    def map_shard_type_to_service_and_namespace(self, shard_type):
+        """ Convert a shard type to a service and namespace
+
+        Args:
+        shard_type - A shard type
+
+        Returns:
+        A tuple of service name and namespace
+        """
+        if '_' in shard_type:
+            (service, namespace) = shard_type.split('_')
+        else:
+            service = shard_type
+            namespace = ''
+        return (service, namespace)
+
+    def map_shard_to_replica_and_db(self, shard):
+        """ Map a shard to a replica set and a db
+
+        Args:
+        shard - A shard name
+
+        Returns:
+        A tuple of a replica set name and a db name
+        """
+        (s, ns, s_num) = environment_specific.deconstruct_shard_name(shard)
+        s_map = self.get_zk_mysql_shard_map()
+        s_data = s_map['services'][s]['namespaces'][ns]['shards'][str(s_num)]
+        return (s_data['replica_set'], s_data['mysqldb'])
+
+    def get_example_db_and_replica_set_for_shard_type(self, shard_type):
+        """ Get an example shard for a given shard type.
+        Note: by convention, the example shard is shard number 0.
+
+        Args:
+        shard_type - A shard type
+
+        Returns:
+        A tuple of a replica set name and a db name
+        """
+        (s, ns) = self.map_shard_type_to_service_and_namespace(shard_type)
+        shard_map = self.get_zk_mysql_shard_map()
+        shard_data = shard_map['services'][s]['namespaces'][ns]['shards']['0']
+        return (shard_data['replica_set'], shard_data['mysqldb'])
+
+    def get_zk_mysql_shard_map(self, use_test=False):
+        """ Load the ZK-based shard-to-server mapping data.
+
+        Returns:
+            A dict where the keys are service names and the values are
+            dicts containing namespace and shard mapping info.
+
+        Example:
+        {u'zenfollowermysql': {
+            u'namespaces': {
+                u'': {
+                    u'shards': {
+                        u'0': {
+                            u'mysqldb': u'zendata000000',
+                            u'replica_set': u'myzenfollower16db001'
+                        }, ...
+                    }
+                }
+            }
+        }
+        """
+        if use_test:
+            with open(MYSQL_SHARD_MAP_ZK_TEST) as f:
+                return json.loads(f.read())
+
+        global _shard_map
+        global _shard_map_refresh
+        if _shard_map and (_shard_map_refresh > time.time() - 1):
+            return _shard_map
+
+        with open(MYSQL_SHARD_MAP_ZK) as f:
+            _shard_map = json.loads(f.read())
+            _shard_map_refresh = time.time()
+
+        return _shard_map
 
     def get_all_mysql_config(self):
         """ Get all MySQL shard mappings.
@@ -360,19 +519,19 @@ class MysqlZookeeper:
 
         Example:
         {u'db00001': {u'db': None,
-                  u'master': {u'host': u'sharddb001h',
+                  u'master': {u'host': u'sharddb-1-43',
                               u'port': 3306},
                   u'passwd': u'redacted',
-                  u'slave': {u'host': u'sharddb001i',
-                              u'port': 3306},
-                  u'dr_slave': {u'host': u'sharddb001j',
-                              u'port': 3306},
+                  u'slave': {u'host': u'sharddb-1-42',
+                             u'port': 3306},
+                  u'dr_slave': {u'host': u'sharddb-1-44',
+                                u'port': 3306},
                   u'user': u'pbuser'},
          u'abexperimentsdb001': {u'db': u'abexperimentsdb',
-                                 u'master': {u'host': u'abexperimentsdb001a',
+                                 u'master': {u'host': u'abexperimentsdb-1-10',
                                              u'port': 3306},
                                 u'passwd': u'redacted',
-                                u'slave': {u'host': u'abexperimentsdb001b',
+                                u'slave': {u'host': u'abexperimentsdb-1-12',
                                            u'port': 3306},
                                 u'user': u'redacted'},
         ...
@@ -396,24 +555,27 @@ class MysqlZookeeper:
         return set(self.get_all_mysql_config().keys())
 
     def get_all_mysql_instances_by_type(self, repl_type):
-        """ Query for all MySQL dr_slaves
+        """ Query for all MySQL instances of a given type (role)
 
         Args:
         repl_type - A replica type, valid options are entries in REPLICA_TYPES
 
         Returns:
-        A list of all MySQL instances of the type repl_type
+        A set of HostAddr objects of all MySQL instances of the type repl_type
 
         Example:
-        set([u'sharddb017g:3306',
-             u'sharddb014d:3306',
-             u'sharddb004h:3306',
+        set([modsharddb-3-20:3306, sharddb-43-36:3306, .... ])
         """
+        global _all_instances
+        if repl_type in _all_instances and \
+                (_all_instances[repl_type]['refresh'] > time.time() - 1):
+            return _all_instances[repl_type]['instances']
 
         if repl_type not in REPLICA_TYPES:
             raise Exception('Invalid repl_type {repl_type}. Valid options are'
-                            '{REPLICA_TYPES}'.format(repl_type=repl_type,
-                                                     REPLICA_TYPES=REPLICA_TYPES))
+                            '{REPLICA_TYPES}'.format(
+                                repl_type=repl_type,
+                                REPLICA_TYPES=REPLICA_TYPES))
         hosts = set()
         for replica_set in self.get_all_mysql_config().iteritems():
             if repl_type in replica_set[1]:
@@ -422,18 +584,18 @@ class MysqlZookeeper:
                                               str(host['port']))))
                 hosts.add(hostaddr)
 
-        return hosts
+        _all_instances[repl_type] = {'refresh': time.time(),
+                                     'instances': hosts}
+        return _all_instances[repl_type]['instances']
 
     def get_all_mysql_instances(self):
         """ Query ZooKeeper for all MySQL instances
 
         Returns:
-        A list of all MySQL instances.
+        A set of HostAddr objects of all MySQL instances.
 
         Example:
-        set([u'sharddb017g:3306',
-             u'sharddb017h:3306',
-             u'sharddb004h:3306',
+        set([modsharddb-3-20:3306, sharddb-43-36:3306, ....])
         """
 
         hosts = set()
@@ -442,9 +604,8 @@ class MysqlZookeeper:
             for rtype in REPLICA_TYPES:
                 if rtype in config[replica_set]:
                     host = config[replica_set][rtype]
-                    hostaddr = HostAddr(''.join((host['host'],
-                                                 ':',
-                                                 str(host['port']))))
+                    hostaddr = HostAddr(':'.join((host['host'],
+                                                  str(host['port']))))
                     hosts.add(hostaddr)
 
         return hosts
@@ -463,118 +624,149 @@ class MysqlZookeeper:
         """
         if repl_type not in REPLICA_TYPES:
             raise Exception('Invalid repl_type {repl_type}. Valid options are'
-                            '{REPLICA_TYPES}'.format(repl_type=repl_type,
-                                                     REPLICA_TYPES=REPLICA_TYPES))
+                            '{REPLICA_TYPES}'.format(
+                                repl_type=repl_type,
+                                REPLICA_TYPES=REPLICA_TYPES))
 
         all_config = self.get_all_mysql_config()
         if replica_set not in all_config:
-            raise Exception('Unknown replica set '
-                            '{replica_set}'.format(replica_set=replica_set))
+            raise Exception('Unknown replica set {}'.format(replica_set))
 
         if repl_type not in all_config[replica_set]:
             return None
 
         instance = all_config[replica_set][repl_type]
         hostaddr = HostAddr(':'.join((instance['host'],
-                                     str(instance['port']))))
+                                      str(instance['port']))))
         return hostaddr
 
-    def get_replica_set_from_instance(self, instance, rtypes=REPLICA_TYPES):
+    def get_replica_set_from_instance(self, instance):
         """ Get the replica set based on zk info
 
         Args:
         instance - a hostaddr object
-        rtypes - a list of replica types to check, default is REPLICA_TYPES
 
         Returns:
-        (replica_set, replica_type)
-        replica_set - A replica set which the instance is part
-        replica_type - The role of the instance in the replica_set
+        replica_set - A replica set of which the instance is part
+        """
+        global _instance_rs_map
+
+        if not _instance_rs_map:
+            config = self.get_all_mysql_config()
+            for rs in config:
+                for rtype in REPLICA_TYPES:
+                    if rtype in config[rs]:
+                        hostaddr = HostAddr('{h}:{p}'.format(
+                            h=config[rs][rtype]['host'],
+                            p=config[rs][rtype]['port']))
+
+                        _instance_rs_map[hostaddr] = rs
+
+        if instance not in _instance_rs_map:
+            raise Exception('{} is not in zk'.format(instance))
+
+        return _instance_rs_map[instance]
+
+    def get_replica_type_from_instance(self, instance):
+        """ Get the replica set role (master, slave, etc) based on zk info
+        ## TODO: use consistent naming.  role or type, not both.
+        Args:
+        instance - a hostaddr object
+
+        Returns:
+        replica_set_role - A replica set role of master, slave, etc...
         """
         config = self.get_all_mysql_config()
-        for replica_set in config:
-            for rtype in rtypes:
-                if rtype in config[replica_set]:
-                    if (instance.hostname == config[replica_set][rtype]['host'] and
-                            instance.port == config[replica_set][rtype]['port']):
-                        return (replica_set, rtype)
-        raise Exception('{instance} is not in zk for replication '
-                        'role(s): {rtypes}'.format(instance=instance,
-                                                   rtypes=rtypes))
+        for rs in config:
+            for rtype in REPLICA_TYPES:
+                if rtype in config[rs]:
+                    if (instance.hostname == config[rs][rtype]['host'] and
+                            instance.port == config[rs][rtype]['port']):
+                        return rtype
 
-    def get_host_shard_map(self, repl_type=REPLICA_ROLE_MASTER):
-        """ Get a mapping of what shards exist on MySQL master servers
+        raise Exception('{} is not in zk'.format(instance))
 
-        Args:
-        repl_type: optionally specify a replica type
-
-        Returns:
-        A dict with a key of the MySQL master instance and the value a set
-        of shards
-        """
-        global_shard_map = dict()
-        for sharded_db in environment_specific.SHARDED_DBS_PREFIX_MAP.values():
-            shard_map = self.compute_shard_map(sharded_db['mappings'],
-                                               sharded_db['prefix'],
-                                               sharded_db['zpad'])
-            for entry in shard_map:
-                if entry in global_shard_map:
-                    global_shard_map[entry].update(shard_map[entry])
-                else:
-                    global_shard_map[entry] = shard_map[entry]
-
-        host_shard_map = dict()
-        for replica_set in global_shard_map:
-            instance = self.get_mysql_instance_from_replica_set(replica_set,
-                                                                repl_type)
-            host_shard_map[instance.__str__()] = global_shard_map[replica_set]
-
-        return host_shard_map
-
-    def compute_shard_map(self, mapping, prefix, zpad):
-        """ Get mapping of shards to replica_sets
+    def find_shard(self, replica_set, db):
+        """ Find shard metadata based on a replica_set and a db
 
         Args:
-        mapping - A list of dicts representing shard ranges mapping to
-                  a replica set. Example:
-                  {'range':(    0,   63), 'host':'db00001'}
-        preface - The preface of the db name. Formula for dbname is
-                  preface + z padded shard number
-        zpad - The amount of z padding to use
+            replica_set - A replica set
+            db - A database name
 
         Returns:
-        A dict with a key of the replica set name and the value being
-        a set of strings which are shard names
+            service - A service name such as zenshared
+            namespace - A namespace name such as video, etc..
+            shard - A shard id
         """
-        shard_mapping = dict()
-        # Note there may be multiple ranges for each replica set
-        for replica_set in mapping:
-            for shard_num in range(replica_set['range'][0],
-                                   replica_set['range'][1] + 1):
-                shard_name = ''.join((prefix, str(shard_num).zfill(zpad)))
-                # Note: host in this context means replica set name
-                if replica_set['host'] not in shard_mapping:
-                    shard_mapping[replica_set['host']] = set()
-                shard_mapping[replica_set['host']].add(shard_name)
+        zk_shard_map = self.get_zk_mysql_shard_map()
+        for s in zk_shard_map['services'].keys():
+            namespaces = zk_shard_map['services'][s]['namespaces'].keys()
+            for ns in namespaces:
+                for shard in zk_shard_map['services'][s]['namespaces'][ns]['shards']:
+                    if (zk_shard_map['services'][s]['namespaces'][ns]['shards'][shard]['replica_set'] == replica_set and
+                            str(zk_shard_map['services'][s]['namespaces'][ns]['shards'][shard]['mysqldb']) == db):
+                        return s, ns, shard
 
-        return shard_mapping
+        raise Exception('Could not find db {db} on replica_set {rs}'
+                        ''.format(db=db, rs=replica_set))
+
+    def get_sharded_dbs_by_replica_set(self):
+        """ Get a mapping of what db (not shard name!) exist on all
+            replica sets
+
+        Returns:
+            A dict where the key is the MySQL replica sets and the
+            value is the set of dbs on that master instance.
+        """
+        zk_shard_map = self.get_zk_mysql_shard_map()
+        rs_to_dbs_map = dict()
+        for replica_set in self.get_all_mysql_replica_sets():
+            rs_to_dbs_map[replica_set] = set()
+
+        for s in self.get_sharded_services():
+            for ns in zk_shard_map['services'][s]['namespaces']:
+                for shard_num in zk_shard_map['services'][s]['namespaces'][ns]['shards']:
+                    rs_to_dbs_map[zk_shard_map['services'][s]['namespaces'][ns]['shards'][shard_num]['replica_set']].add(
+                        zk_shard_map['services'][s]['namespaces'][ns]['shards'][shard_num]['mysqldb'])
+
+        return rs_to_dbs_map
+
+    def get_shards_by_replica_set(self):
+        """ Get a mapping of what shards (not db names!) exist on all replica
+            sets
+
+        Returns:
+            A dict where the key is the replica set and the value
+            is a set of shards.
+        """
+        zk_shard_map = self.get_zk_mysql_shard_map()
+        rs_to_shards_map = dict()
+        for replica_set in self.get_all_mysql_replica_sets():
+            rs_to_shards_map[replica_set] = set()
+
+        for s in self.get_sharded_services():
+            for ns in zk_shard_map['services'][s]['namespaces']:
+                for shard_num in zk_shard_map['services'][s]['namespaces'][ns]['shards']:
+                    rs_to_shards_map[zk_shard_map['services'][s]['namespaces'][ns]['shards'][shard_num]['replica_set']].add(
+                        environment_specific.construct_shard_name(s, ns,
+                                                                  shard_num))
+
+        return rs_to_shards_map
 
     def shard_to_instance(self, shard, repl_type=REPLICA_ROLE_MASTER):
-        """ Convert a shard to  hostname
+        """ Convert a shard to hostname
 
         Args:
-        shard - A shard name
-        repl_type - Replica type, master is default
+            shard - A shard name
+            repl_type - Replica type, master is default
 
         Returns:
-        A hostaddr object for an instance of the replica set
+            A hostaddr object for an instance of the replica set
         """
-        shard_map = self.get_host_shard_map(repl_type)
-        for instance in shard_map:
-            if shard in shard_map[instance]:
-                return HostAddr(instance)
-
-        raise Exception('Could not determine shard replica set for shard {shard}'.format(shard=shard))
+        (rs, db) = self.map_shard_to_replica_and_db(shard)
+        instance = self.get_mysql_instance_from_replica_set(
+                        rs, repl_type=repl_type)
+        return instance
 
     def get_shards_by_shard_type(self, shard_type):
         """ Get a set of all shards in a shard type
@@ -583,93 +775,87 @@ class MysqlZookeeper:
         shard_type - The type of shards, i.e. 'sharddb'
 
         Returns:
-        A set of all shard names
+            A set of all shard names
         """
-        sharding_info = environment_specific.SHARDED_DBS_PREFIX_MAP[shard_type]
         shards = set()
-        for replica_set in sharding_info['mappings']:
-            for shard_num in range(replica_set['range'][0],
-                                   replica_set['range'][1] + 1):
-                shards.add(''.join((sharding_info['prefix'],
-                                    str(shard_num).zfill(sharding_info['zpad']))))
+        (s, ns) = self.map_shard_type_to_service_and_namespace(shard_type)
+        zk_shard_map = self.get_zk_mysql_shard_map()
+        for shard in zk_shard_map['services'][s]['namespaces'][ns]['shards']:
+            shards.add(environment_specific.construct_shard_name(s, ns, shard))
+
         return shards
 
 
 class HostAddr:
     """Basic abtraction for hostnames"""
+
     def __init__(self, host):
         """
         Args:
-        host - A hostname. We have two fully supported formats:
-               {replicaType}-{replicaSetNum}-{hostNum} - new style
-               {replicaType}{replicaSetNum}{hostLetter} - old style
+        host - A hostname. We have one fully supported format:
+               {prefix}-{replicaSetNum}-{hostNum}
         """
-        self.replica_type = None
+        self.hostname_prefix = None
         self.replica_set_num = None
         self.host_identifier = None
+        self.standardized_replica_set = None
 
-        host_params = re.split(':', host)
-        self.hostname = re.split('\.', host_params[0])[0]
+        host_params = host.split(':')
+        self.hostname = host_params[0].split('.')[0]
         if len(host_params) > 1:
             self.port = int(host_params[1])
         else:
             self.port = 3306
 
-        # New style hostnames are of the form replicaType-replicaSetNum-hostNum
+        # New style hostnames are of the form prefix-replicaSetNum-hostNum
         # ie: sharddb-1-1
         try:
-            (self.replica_type, self.replica_set_num,
+            (self.hostname_prefix, self.replica_set_num,
              self.host_identifier) = self.hostname.split('-')
-        except ValueError:
-            # Maybe a old sytle hostname
-            # form is replicaTypereplicaSetNumhostLetter
-            # ie: sharddb001a
-            replica_set_match = re.match('([a-zA-z]+)0+([0-9]+)([a-z])', self.hostname)
-            if replica_set_match:
-                try:
-                    (self.replica_type, self.replica_set_num, self.host_identifier)\
-                        = replica_set_match.groups()
-                except ValueError:
-                    # Not an old style hostname either, weird.
-                    pass
-            else:
-                replica_set_match = re.match('([a-zA-z0-9]+db)0+([0-9]+)([a-z])', self.hostname)
-                try:
-                    (self.replica_type, self.replica_set_num, self.host_identifier)\
-                        = replica_set_match.groups()
-                    self.replica_type = ''.join((self.replica_type, 'db'))
-                except:
-                    pass
+
+            ## TODO: COMPATIBILITY
+            self.replica_type = self.hostname_prefix
+            ## COMPATIBILITY
+        except:
+            raise Exception('Invalid instance {}'.format(self.hostname))
 
     def get_standardized_replica_set(self):
         """ Return an easily parsible replica set name
 
         Returns:
-        A replica set name which is hyphen seperated with the first part
-        being the replica set type (ie sharddb), followed by a the replica
-        set identifier. If this is not availible, return None.
+            A replica set name which is hyphen seperated with the first part
+            being the replica set type (ie sharddb), followed by a the replica
+            set identifier.
         """
-        if self.replica_type and self.replica_set_num:
-            return '-'.join((self.replica_type, self.replica_set_num))
-        else:
-            return None
+        if self.standardized_replica_set:
+            return self.standardized_replica_set
 
-    def get_zk_replica_set(self):
-        """ Determine what replica set a host would belong to
+        self.standardized_replica_set = '-'.join((self.hostname_prefix,
+                                                  self.replica_set_num))
+        return self.standardized_replica_set
+
+    def guess_zk_replica_set(self):
+        """ Determine what replica set a host would belong to.
 
         Returns:
-        A replica set name
+            A replica set name
         """
         zk = MysqlZookeeper()
-        for master in zk.get_all_mysql_instances_by_type(REPLICA_ROLE_MASTER):
-            if self.get_standardized_replica_set() == master.get_standardized_replica_set():
-                return zk.get_replica_set_from_instance(master)
+        std_to_rs_map = dict()
+        for m in zk.get_all_mysql_instances_by_type(REPLICA_ROLE_MASTER):
+            std_to_rs_map[m.get_standardized_replica_set()] = \
+                zk.get_replica_set_from_instance(m)
+
+        return std_to_rs_map[self.get_standardized_replica_set()]
+
+    ## TODO: COMPATIBILITY - REMOVE LATER
+    def get_zk_replica_set(self):
+        return self.guess_zk_replica_set()
+    ## COMPATIBILITY
 
     def __str__(self):
-        """
-        Returns
-        a  human readible string version of object similar to
-        'shardb123a:3309'
+        """ Returns a human readable string version of object similar to
+            'sharddb-12-3:3309'
         """
         return ''.join((self.hostname, ':', str(self.port)))
 
@@ -696,13 +882,13 @@ def shell_exec(cmd):
     """ Run a shell command
 
     Args:
-    cmd - String to execute via a shell. DO NOT use this if the stdout or stderr
-          will be very large (more than 100K bytes or so)
+    cmd - String to execute via a shell. DO NOT use this if the stdout or
+          stderr will be very large (more than 100K bytes or so)
 
     Returns:
-    std_out - Standard out results from the execution of the command
-    std_err - Standard error results from the execution of the command
-    return_code - Return code from the execution of the command
+        std_out - Standard out results from the execution of the command
+        std_err - Standard error results from the execution of the command
+        return_code - Return code from the execution of the command
     """
     proc = subprocess.Popen(cmd,
                             shell=True,
@@ -735,8 +921,9 @@ def check_dict_of_procs(proc_dict):
             success = False
         elif ret != 0:
             raise Exception('{proc_id}: {proc} encountered an error'
-                            ''.format(proc_id=multiprocessing.current_process().name,
-                                      proc=proc))
+                            ''.format(
+                proc_id=multiprocessing.current_process().name,
+                proc=proc))
     return success
 
 
@@ -889,6 +1076,28 @@ def get_iam_role():
     c.setopt(c.WRITEFUNCTION, buf.write)
     c.perform()
     c.close()
-
     profile = json.loads(buf.getvalue())['InstanceProfileArn']
     return profile[(1 + profile.index("/")):]
+
+
+def get_security_group():
+    """ Get the Security group name for the local server
+
+    Returns: security group name
+    """
+    buf = StringIO.StringIO()
+    c = pycurl.Curl()
+    c.setopt(c.URL, 'http://169.254.169.254/latest/meta-data/security-groups')
+    c.setopt(c.WRITEFUNCTION, buf.write)
+    c.perform()
+    c.close()
+    return buf.getvalue()
+
+
+def get_security_role():
+    """ Get the security role of the current environment
+
+    Returns a security role
+    """
+    arn = boto3.client('sts').get_caller_identity().get('Arn')
+    return re.search('.+assumed-role/([^/]+).+', arn).group(1)

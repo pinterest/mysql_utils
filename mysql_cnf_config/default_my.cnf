@@ -46,7 +46,8 @@ sync_binlog = 1
 # Connections
 user = mysql
 port = 3306
-max_connections = 4500
+max_user_connections = 4500
+max_connections = 5000
 max_connect_errors = 1844674407370954752
 
 # Logging

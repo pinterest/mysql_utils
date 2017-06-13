@@ -3,6 +3,7 @@ import argparse
 import ConfigParser
 import glob
 import os
+import time
 
 import mysql_backup
 import mysql_cnf_builder
@@ -52,23 +53,25 @@ def main():
 
 
 def mysql_init_server(instance,
-                      skip_production_check=False, skip_locking=False,
-                      skip_backup=True):
+                      skip_production_check=False, 
+                      skip_backup=True, lock_handle=None):
     """ Remove any data and initialize a MySQL instance
 
     Args:
     instance - A hostaddr object pointing towards localhost to act upon
     skip_production_check - Dangerous! will not run safety checks to protect
                             production data
-    skip_locking - Do not take a lock on localhost. Useful when the caller has
-                   already has taken the lock (ie mysql_restore_xtrabackup)
     skip_backup - Don't run a backup after the instance is setup
+    lock_handle - If the caller already locked the system, pass in the
+                  lock handle, as we may need to release and reacquire
+                  to prevent mysqld from keeping it.
     """
-    lock_handle = None
-    if not skip_locking:
+    if lock_handle is None:
         # Take a lock to prevent multiple restores from running concurrently
-        log.info('Taking a flock to block race conditions')
-        lock_handle = host_utils.take_flock_lock(backup.BACKUP_LOCK_FILE)
+        log.info('Taking a lock to block race conditions')
+        lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
+    else:
+        log.info('Lock already exists from caller.')
 
     try:
         # sanity check
@@ -120,13 +123,27 @@ def mysql_init_server(instance,
         log.info('MySQL initalization complete')
 
     finally:
-        if not skip_locking and lock_handle:
-            log.info('Releasing lock')
-            host_utils.release_flock_lock(lock_handle)
+        # We have to do this, ugly though it may be, to ensure that
+        # the running MySQL process doesn't maintain a hold on the lock
+        # socket after the script exits.  We reacquire the lock after
+        # the restart and pass it back to the caller.
+        #
+        if lock_handle:
+            log.info('Restarting MySQL, releasing lock.')
+            host_utils.stop_mysql(instance.port)
+            log.info('Sleeping 5 seconds.')
+            time.sleep(5)
+            host_utils.release_lock_socket(lock_handle)
+            host_utils.start_mysql(instance.port)
+            log.info('Reacquiring lock.')
+            lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
 
     if not skip_backup:
         log.info('Taking a backup')
-        mysql_backup.mysql_backup(instance, initial_build=True)
+        mysql_backup.mysql_backup(instance, initial_build=True,
+                                  lock_handle=lock_handle)
+
+    return lock_handle
 
 
 def basic_host_sanity():

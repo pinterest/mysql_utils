@@ -12,6 +12,7 @@ from lib import mysql_lib
 
 DEFAULT_MYSQL_MAJOR_VERSION = '5.6'
 DEFAULT_MYSQL_MINOR_VERSION = 'stable'
+DEFAULT_OS_FLAVOR = 'trusty'
 # After SERVER_BUILD_TIMEOUT we can assume that the build failed
 # and automatically go into --replace_again mode
 SERVER_BUILD_TIMEOUT = 7
@@ -77,6 +78,10 @@ def main():
                         choices=environment_specific.SUPPORTED_MYSQL_MINOR_VERSIONS,
                         # default is set in the underlying function
                         default=None)
+    parser.add_argument('--override_os_flavor',
+                        help="Which flavor of OS to target.  Default is 'precise'",
+                        choices=environment_specific.SUPPORTED_OS_FLAVORS,
+                        default=None)
     parser.add_argument('--override_vpc_security',
                         help=('Do not replace with an instance in the same '
                               'security group, instead use the supplied '
@@ -90,7 +95,8 @@ def main():
                  'instance_type': args.override_hw,
                  'mysql_major_version': args.override_mysql_major_version,
                  'mysql_minor_version': args.override_mysql_minor_version,
-                 'vpc_security_group': args.override_vpc_security}
+                 'vpc_security_group': args.override_vpc_security,
+                 'os_flavor': args.override_os_flavor}
 
     launch_replacement_db_host(original_server=host_utils.HostAddr(args.server),
                                dry_run=args.dry_run,
@@ -115,28 +121,33 @@ def launch_replacement_db_host(original_server,
                         automation won't put it into prod use.
     overrides - A dict of overrides. Availible keys are
                 'mysql_minor_version', 'hostname', 'vpc_security_group',
-                'availability_zone', 'instance_type', and 'mysql_major_version'.
+                'availability_zone', 'instance_type', 'mysql_major_version',
+                'os_flavor'
     reason - A description of why the host is being replaced. If the instance
              is still accessible and reason is not supply an exception will be
              thrown.
     replace_again - If True, ignore already existing replacements.
     """
+    if host_utils.get_security_role() not in environment_specific.ROLE_TO_LAUNCH_INSTANCE:
+        raise Exception(environment_specific.ROLE_ERROR_MSG)
+
     reasons = set()
     if reason:
         reasons.add(reason)
 
-    log.info('Trying to launch a replacement for host {host} which is part '
-             'of replica set is {replica_set}'.format(host=original_server.hostname,
-                                                      replica_set=original_server.get_zk_replica_set()[0]))
-
     zk = host_utils.MysqlZookeeper()
     try:
-        (_, replica_type) = zk.get_replica_set_from_instance(original_server)
+        replica_set = zk.get_replica_set_from_instance(original_server)
+        replica_type = zk.get_replica_type_from_instance(original_server)
     except:
         raise Exception('Can not replace an instance which is not in zk')
+
     if replica_type == host_utils.REPLICA_ROLE_MASTER:
-        # If the instance, we will refuse to run. No ifs, ands, or buts/
         raise Exception('Can not replace an instance which is a master in zk')
+
+    log.info('Trying to launch a replacement for host {host} which is part '
+             'of replica set {rs}'.format(host=original_server.hostname,
+                                          rs=replica_set))
 
     # Open a connection to MySQL Ops and check if a replacement has already
     # been requested
@@ -176,7 +187,7 @@ def launch_replacement_db_host(original_server,
             raise
         log.info('MySQL is down, assuming hardware failure')
         reasons.add('hardware failure')
-        version_server = zk.get_mysql_instance_from_replica_set(original_server.get_zk_replica_set()[0],
+        version_server = zk.get_mysql_instance_from_replica_set(replica_set,
                                                                 repl_type=host_utils.REPLICA_ROLE_MASTER)
 
     # Pull some information from cmdb.
@@ -186,16 +197,17 @@ def launch_replacement_db_host(original_server,
                         'replaced in the cmdb')
 
     if 'aws_status.codes' in cmdb_data:
-        reasons.add(cmdb_data['aws_status.codes'])
+        reasons.add(cmdb_data['aws_status.codes'][0] if cmdb_data['aws_status.codes'] else '')
 
     log.info('Data from cmdb: {cmdb_data}'.format(cmdb_data=cmdb_data))
     replacement_config = {'availability_zone': cmdb_data['location'],
-                          'vpc_security_group': cmdb_data['security_groups'],
+                          'vpc_security_group': cmdb_data['security_groups'][0],
                           'hostname': find_unused_server_name(original_server.get_standardized_replica_set(),
                                                               reporting_conn, dry_run),
                           'instance_type': cmdb_data['config.instance_type'],
                           'mysql_major_version': mysql_lib.get_global_variables(version_server)['version'][0:3],
                           'mysql_minor_version': DEFAULT_MYSQL_MINOR_VERSION,
+                          'os_flavor': cmdb_data['facts.lsbdistcodename'] or DEFAULT_OS_FLAVOR,
                           'dry_run': dry_run,
                           'skip_name_check': True}
 
@@ -275,11 +287,6 @@ def find_unused_server_name(replica_set, conn, dry_run):
         # cmdb and find out the greatest host number in use for a replica set
         if not host.host_identifier:
             # unparsable, probably not previously under dba management
-            continue
-
-        if (len(host.host_identifier) == 1 and
-                ord(host.host_identifier) in range(ord('a'), ord('z'))):
-            # old style hostname
             continue
 
         if int(host.host_identifier) >= next_host_num:

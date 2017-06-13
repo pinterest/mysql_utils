@@ -1,10 +1,12 @@
 #!/usr/bin/python
-import argparse
 
+import argparse
+import logging
 from lib import mysql_lib
 from lib import host_utils
 from lib import environment_specific
 
+log = logging.getLogger(__name__)
 
 def restart_pt_kill_if_not_exists(instance):
     """
@@ -37,7 +39,7 @@ def restart_pt_heartbeat_if_not_exists(instance):
     connected_users = mysql_lib.get_connected_users(instance)
     zk = host_utils.MysqlZookeeper()
     try:
-        (_, replica_type) = zk.get_replica_set_from_instance(instance)
+        replica_type = zk.get_replica_type_from_instance(instance)
     except:
         replica_type = None
     pthb_user, pthb_pass = mysql_lib.get_mysql_user_for_role('ptheartbeat')
@@ -70,5 +72,5 @@ def main():
 
 
 if __name__ == "__main__":
-    log = environment_specific.setup_logging_defaults(__name__)
+    environment_specific.initialize_logger()
     main()

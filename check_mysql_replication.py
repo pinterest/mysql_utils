@@ -19,7 +19,7 @@ def main():
     slave_hostaddr = host_utils.HostAddr(args.replica)
 
     if args.watch_for_catch_up:
-        mysql_lib.wait_replication_catch_up(slave_hostaddr)
+        mysql_lib.wait_for_catch_up(slave_hostaddr)
     else:
         ret = mysql_lib.calc_slave_lag(slave_hostaddr)
         print "Heartbeat_seconds_behind: {sbm}".format(sbm=ret['sbm'])

@@ -8,7 +8,6 @@ import sys
 import pprint
 
 import boto
-import mysql_backup_csv
 from lib import backup
 from lib import environment_specific
 from lib import host_utils
@@ -129,10 +128,13 @@ def verify_flexsharded_csv_backup(shard_type, date, dev_bucket=False):
     missing_uploads = set()
 
     for db in mysql_lib.get_dbs(schema_host):
-        for table in mysql_backup_csv.mysql_backup_csv(schema_host).get_tables_to_backup(db):
+        table_list = ['{}.{}'.format(db, x) for x in mysql_lib.get_tables(schema_host, db, True)]
+        table_tuples = backup.filter_tables_to_csv_backup(schema_host, table_list)
+
+        for t in table_tuples:
             try:
-                verify_csv_schema_upload(schema_host, db, [table],
-                                         date, dev_bucket)
+                verify_csv_schema_upload(schema_host, db, [t[0].split('.')[1]],
+                                         date=date, dev_bucket=dev_bucket)
             except:
                 continue
 
@@ -140,7 +142,8 @@ def verify_flexsharded_csv_backup(shard_type, date, dev_bucket=False):
             for replica_set in replica_sets:
                 chk_instance = zk.get_mysql_instance_from_replica_set(replica_set)
                 (_, data_path, success_path) = backup.get_csv_backup_paths(
-                                                   chk_instance, db, table, date)
+                                                   chk_instance, db, t[0].split('.')[1],
+                                                   date=date, partition_number=t[2])
 
                 k = bucket.get_key(data_path)
                 if k is None:
@@ -196,18 +199,35 @@ def verify_sharded_csv_backup_by_shard_type(shard_type, date,
     schema_host = zk.get_mysql_instance_from_replica_set(replica_set,
                       repl_type=host_utils.REPLICA_ROLE_SLAVE)
 
-    tables = mysql_backup_csv.mysql_backup_csv(schema_host).get_tables_to_backup(db)
-    if not tables:
+    table_list = ['{}.{}'.format(db, x) for x in mysql_lib.get_tables(schema_host, db, True)]
+    table_tuples = backup.filter_tables_to_csv_backup(schema_host, table_list)
+
+    if not table_tuples:
         raise Exception('No tables will be checked for backups')
 
-    verify_csv_schema_upload(schema_host, db, tables, date, dev_bucket)
+    verify_csv_schema_upload(schema_host, db, [x[0].split('.')[1] for x in table_tuples], date, dev_bucket)
 
     shards = zk.get_shards_by_shard_type(shard_type)
     if not shards:
         raise Exception('No shards will be checked for backups')
 
-    missing_uploads = verify_sharded_csv_backup_by_shards(shards, tables,
-                                                          date, dev_bucket)
+    (finished_uploads,
+     missing_uploads) = verify_sharded_csv_backup_by_shards(shards, table_tuples,
+                                                            date, dev_bucket)
+
+    if finished_uploads:
+        boto_conn = boto.connect_s3()
+        bucket_name = environment_specific.S3_CSV_BUCKET_DEV \
+            if dev_bucket else environment_specific.S3_CSV_BUCKET
+        bucket = boto_conn.get_bucket(bucket_name, validate=False)
+        for tbl in finished_uploads:
+            (_, _, success_path) = backup.get_csv_backup_paths(schema_host, db, tbl, date)
+            if not bucket.get_key(success_path):
+                print 'Creating success key {b}/{k}'.format(b=bucket_name,
+                                                            k=success_path)
+                key = bucket.new_key(success_path)
+                key.set_contents_from_string(' ')
+
     if missing_uploads:
         if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
             print ('Shard type {} is missing uploads:'.format(shard_type))
@@ -219,14 +239,17 @@ def verify_sharded_csv_backup_by_shard_type(shard_type, date,
         return False
     else:
         # we have checked all shards, all are good, create success files
+        # that might not already be present.  theoretically, everything here
+        # will get picked up by the finished_uploads stanza earlier, but
+        # we have this here as a failsafe.
         boto_conn = boto.connect_s3()
         bucket_name = environment_specific.S3_CSV_BUCKET_DEV \
             if dev_bucket else environment_specific.S3_CSV_BUCKET
         bucket = boto_conn.get_bucket(bucket_name, validate=False)
-
-        for table in tables:
+        for t in table_tuples:
             (_, _, success_path) = backup.get_csv_backup_paths(
-                                       schema_host, db, table, date)
+                                       schema_host, *t[0].split('.'), date=date,
+                                       partition_number=t[2])
             if not bucket.get_key(success_path):
                 print 'Creating success key {b}/{k}'.format(b=bucket_name,
                                                             k=success_path)
@@ -237,54 +260,63 @@ def verify_sharded_csv_backup_by_shard_type(shard_type, date,
     return True
 
 
-def verify_sharded_csv_backup_by_shards(shards, tables, date,
+def verify_sharded_csv_backup_by_shards(shards, table_tuples, date,
                                         dev_bucket=False):
     """ Verify that shards has been backed up to hive
 
     Args:
         shards - A set of shard names to check
-        tables - A set of table names to check
+        table_tuples - A set of table tuples to check
         date - The date to search for
         dev_bucket - Use the dev bucket?
 
     Returns:
-        True for no problems found, False otherwise.
+        A set of tables that are finished and a set of tables that
+        are still missing some uploads.
     """
     pool = multiprocessing.Pool(processes=CSV_CHECK_PROCESSES)
     pool_args = list()
-    for table in tables:
-        pool_args.append((table, date, shards, dev_bucket))
+    for t in table_tuples:
+        pool_args.append((t, date, shards, dev_bucket))
 
     results = pool.map(get_sharded_db_missing_uploads, pool_args)
     missing_uploads = set()
-    for result in results:
-        missing_uploads.update(result)
+    finished_uploads = set()
 
-    return missing_uploads
+    for result in results:
+        if len(result['missing_uploads']) == 0:
+            finished_uploads.add(result['table'])
+        else:
+            missing_uploads.update(result['missing_uploads'])
+
+    return (finished_uploads, missing_uploads)
 
 
 def get_sharded_db_missing_uploads(args):
     """ Check to see if all backups are present
 
     Args: A tuple which can be expanded to:
-        table - table name
+        table_tuple - a tuple of (db.table, partition_name, partition_num)
         shard_type - sharddb, etc
         shards -  a set of shards
         dev_bucket - check the dev bucket instead of the prod bucket?
 
-    Returns: a set of shards which are not backed up
+    Returns: the table name that was checked and a set of shards which
+             are not backed up for the table in question.
     """
-    (table, date, shards, dev_bucket) = args
+    (table_tuple, date, shards, dev_bucket) = args
     zk = host_utils.MysqlZookeeper()
     expected_s3_keys = set()
     prefix = None
+    table_name = table_tuple[0].split('.')[1]
 
     for shard in shards:
         (replica_set, db) = zk.map_shard_to_replica_and_db(shard)
         instance = zk.get_mysql_instance_from_replica_set(replica_set,
                           repl_type=host_utils.REPLICA_ROLE_SLAVE)
         (_, data_path, _) = backup.get_csv_backup_paths(
-                                instance, db, table, date)
+                                instance, db, table_name,
+                                date, table_tuple[2])
         expected_s3_keys.add(data_path)
         if not prefix:
             prefix = os.path.dirname(data_path)
@@ -313,9 +345,10 @@ def get_sharded_db_missing_uploads(args):
             print 'List method did not return data for key:{}'.format(entry)
             missing_uploads.discard(entry)
         else:
-            return missing_uploads
+            return ({'table': table_name,
+                     'missing_uploads': missing_uploads})
 
-    return missing_uploads
+    return ({'table': table_name, 'missing_uploads': missing_uploads})
 
 
 def verify_csv_instance_backup(instance, date, dev_bucket=False):
@@ -361,10 +394,11 @@ def verify_csv_instance_backup(instance, date, dev_bucket=False):
         for shard_type in instance_shard_type_mapping:
             example_shard = list(instance_shard_type_mapping[shard_type])[0]
             (_, db) = zk.map_shard_to_replica_and_db(example_shard)
-            tables = mysql_backup_csv.mysql_backup_csv(instance).get_tables_to_backup(db)
+            table_list = ['{}.{}'.format(db, x) for x in mysql_lib.get_tables(instance, db, True)]
+            table_tuples = backup.filter_tables_to_csv_backup(instance, table_list)
             missing_uploads.update(verify_sharded_csv_backup_by_shards(
-                instance_shard_type_mapping[shard_type], tables, date,
-                dev_bucket))
+                instance_shard_type_mapping[shard_type], table_tuples, date,
+                dev_bucket)[1])
 
         if missing_uploads:
             if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
@@ -403,18 +437,24 @@ def verify_unsharded_csv_backups(instance, date, dev_bucket=False):
     bucket = boto_conn.get_bucket(bucket_name, validate=False)
     missing_uploads = set()
     for db in mysql_lib.get_dbs(instance):
-        tables = mysql_backup_csv.mysql_backup_csv(instance).get_tables_to_backup(db)
+        table_list = ['{}.{}'.format(db, x) for x in mysql_lib.get_tables(instance, db, True)]
+        table_tuples = backup.filter_tables_to_csv_backup(instance, table_list)
         try:
-            verify_csv_schema_upload(instance, db, tables, date,
+            verify_csv_schema_upload(instance, db, [x[0].split('.')[1] for x in table_tuples], date,
                                      dev_bucket)
         except Exception as e:
             print e
             return_status = False
             continue
 
-        for table in tables:
+        table_names = [x[0] for x in table_tuples]
+        expected_partitions = dict((x, table_names.count(x)) for x in table_names)
+        found_partitions = dict()
+
+        for t in table_tuples:
             (_, data_path, success_path) = \
-                backup.get_csv_backup_paths(instance, db, table, date)
+                backup.get_csv_backup_paths(instance, *t[0].split('.'), date=date,
+                                            partition_number=t[2])
             k = bucket.get_key(data_path)
             if k is None:
                 missing_uploads.add(data_path)
@@ -427,13 +467,22 @@ def verify_unsharded_csv_backups(instance, date, dev_bucket=False):
                 k.delete()
                 missing_uploads.add(data_path)
             else:
-                # We still need to create a success file for the data
-                # team for this table, even if something else is AWOL
-                # later in the backup.
-                if bucket.get_key(success_path):
-                    print 'Success key {b}/{k} exists'.format(b=bucket_name,
-                                                              k=success_path)
-                else:
+                found_partitions[t[0]] = 1 + found_partitions.get(t[0], 0)
+
+            # We still need to create a success file for the data
+            # team for this table, even if something else is AWOL
+            # later in the backup.
+            s_key = bucket.get_key(success_path)
+            if s_key:
+                if found_partitions.get(t[0], 0) < expected_partitions[t[0]]:
+                    print ('Success key {b}/{k} exists but it should '
+                           'not - deleting it!').format(b=bucket_name,
+                                                        k=success_path)
+                    s_key.delete()
+                elif found_partitions.get(t[0], 0) == expected_partitions[t[0]]:
+                    print 'Success key {b}/{k} exists!'.format(b=bucket_name,
+                                                               k=success_path)
+            elif found_partitions.get(t[0], 0) == expected_partitions[t[0]]:
                     print 'Creating success key {b}/{k}'.format(b=bucket_name,
                                                                 k=success_path)
                     key = bucket.new_key(success_path)
@@ -591,7 +640,7 @@ def verify_csv_schema_upload(instance, db, tables, date, dev_bucket=False):
                     else environment_specific.S3_CSV_BUCKET
     bucket = boto_conn.get_bucket(bucket_name, validate=False)
     for table in tables:
-        (path, _, _) = backup.get_csv_backup_paths(instance, db, table, date)
+        (path, _, _) = backup.get_csv_backup_paths(instance, db, table, date, 0)
         if not bucket.get_key(path):
             missing.add(path)
             return_status = False
@@ -694,8 +743,8 @@ def main():
                 # don't stop here but continue moving on another check
                 try:
                     if not verify_csv_full_sharded_systems_backup(shard_type,
-                                                              date,
-                                                              args.dev_bucket):
+                                                                  date,
+                                                                  args.dev_bucket):
                         return_code = BACKUP_MISSING_RETURN
                 except Exception as e:
                     print e

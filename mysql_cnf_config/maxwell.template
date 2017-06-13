@@ -20,8 +20,9 @@ binlog_connector=true
 
 kafka_topic_generator={generator}
 kafka.bootstrap.servers={kafka_servers}
-kafka_topic={kafka_topic}
+kafka_topic={namespace}.{kafka_topic}
 kafka.retries=5
+kafka.max.request.size=3145728
 kafka.max.in.flight.requests.per.connection=1
 zen_service_name={zen_service}
 

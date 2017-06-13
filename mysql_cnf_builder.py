@@ -323,6 +323,11 @@ def create_maxwell_config(client_id, instance, exclude_dbs=None,
     (username, password) = mysql_lib.get_mysql_user_for_role('maxwell')
     zk = host_utils.MysqlZookeeper()
     replica_set = zk.get_replica_set_from_instance(instance)
+    hostname_prefix = instance.hostname_prefix
+    if hostname_prefix in environment_specific.FLEXSHARD_DBS or hostname_prefix in environment_specific.SHARDED_DBS_PREFIX:
+        namespace = hostname_prefix
+    else:
+        namespace = replica_set
     master = zk.get_mysql_instance_from_replica_set(replica_set,
                                                     host_utils.REPLICA_ROLE_MASTER)
     log.info('Writing file {}'.format(MAXWELL_CONF_FILE))
@@ -344,7 +349,8 @@ def create_maxwell_config(client_id, instance, exclude_dbs=None,
                                 client_id=client_id,
                                 output=target,
                                 excludes=excluded,
-                                gtid_mode=gtid_mode))
+                                gtid_mode=gtid_mode,
+                                namespace=namespace))
 
 
 def create_mysql_cnf_files(parser, override_dir=None):

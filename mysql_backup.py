@@ -69,7 +69,7 @@ def mysql_backup(instance, backup_type=backup.BACKUP_TYPE_XBSTREAM,
     # maintains it.
     if lock_handle is None:
         log.info('Taking backup lock')
-        lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
+        lock_handle = host_utils.bind_lock_socket(backup.STD_BACKUP_LOCK_SOCKET)
     else:
         log.info('Not acquiring backup lock, we already have one.')
 

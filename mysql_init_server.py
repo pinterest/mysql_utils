@@ -69,7 +69,7 @@ def mysql_init_server(instance,
     if lock_handle is None:
         # Take a lock to prevent multiple restores from running concurrently
         log.info('Taking a lock to block race conditions')
-        lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
+        lock_handle = host_utils.bind_lock_socket(backup.STD_BACKUP_LOCK_SOCKET)
     else:
         log.info('Lock already exists from caller.')
 
@@ -139,7 +139,7 @@ def mysql_init_server(instance,
             host_utils.release_lock_socket(lock_handle)
             host_utils.start_mysql(instance.port)
             log.info('Reacquiring lock.')
-            lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
+            lock_handle = host_utils.bind_lock_socket(backup.STD_BACKUP_LOCK_SOCKET)
 
     if not skip_backup:
         log.info('Taking a backup')

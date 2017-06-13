@@ -26,7 +26,8 @@ BACKUP_SEARCH_PREFIX = ('{backup_type}/{retention_policy}/{replica_set}/'
 BACKUP_SEARCH_INITIAL_PREFIX = ('{backup_type}/initial_build/'
                                 '{hostname}-{port}-{timestamp}')
 BACKUP_LOCK_FILE = '/tmp/backup_mysql.lock'
-BACKUP_LOCK_SOCKET = 'backupmysql'
+CSV_BACKUP_LOCK_SOCKET = 'csvbackupmysql'
+STD_BACKUP_LOCK_SOCKET = 'backupmysql'
 BACKUP_TYPE_LOGICAL = 'mysqldump'
 BACKUP_TYPE_LOGICAL_EXTENSION = 'sql.gz'
 BACKUP_TYPE_CSV = 'csv'
@@ -835,7 +836,7 @@ def create_xbstream_proc(stdin, datadir):
                             stdout=subprocess.PIPE)
 
 
-def get_csv_backup_paths(instance, db, table, date):
+def get_csv_backup_paths(instance, db, table, date, partition_number=0):
     """ Get all relevant paths for a csv backup
 
     Args:
@@ -843,11 +844,12 @@ def get_csv_backup_paths(instance, db, table, date):
         db - a database name
         table - a table name
         date - The date in string form
+        partition_number (optional) - what partition number?
 
     Returns:
         schema_path - the path to the scheam file in s3
         data_path - the path to the data file in s3
-        sucess_path - the path to the success file in s3
+        success_path - the path to the success file in s3
     """
     zk = host_utils.MysqlZookeeper()
     replica_set = zk.get_replica_set_from_instance(instance)
@@ -886,6 +888,7 @@ def get_csv_backup_paths(instance, db, table, date):
                             db_name=db,
                             table=table,
                             date=date,
+                            num=partition_number,
                             replica_set=replica_set),
             success_raw.format(namespace=namespace,
                                db_name=db,
@@ -894,34 +897,83 @@ def get_csv_backup_paths(instance, db, table, date):
                                replica_set=replica_set))
 
 
-def filter_tables_to_csv_backup(instance, db, tables):
-    """ Determine which tables should be backed up in a db
+def filter_tables_to_csv_backup(instance, table_set):
+    """ Given an instance and a set of FQ-tables on that instance, remove
+        the ones that don't need to be backed up and prioritize those that
+        need to happen first.  Return a list of table that are in the
+        desired order.
 
     Args:
         instance - A hostAddr object
-        db -  The db for which we need a list of tables eligible for backup
-        tables - A set of tables
+        table_set - A set of tables on the aforementioned instance.
 
     Returns:
-        A set of table names
+        A list of tables in acceptable order and with the undesirables
+        filtered out.
     """
-    ret_tables = set()
-    if instance.hostname_prefix in environment_specific.FLEXSHARD_DBS:
-        if db not in environment_specific.FLEXSHARDED_IGNORABLE_DBS:
-            for table in tables:
-                skip = False
-                for suffix in environment_specific.FLEXSHARDED_IGNORABLE_TABLES_SUFFIX:
-                    if table.endswith(suffix):
-                        skip = True
-                if not skip:
-                    ret_tables.add(table)
-    elif instance.hostname_prefix in environment_specific.SHARDED_DBS_PREFIX:
-        for table in tables:
-            for suffix in environment_specific.SHARDED_IGNORABLE_TABLES_SUFFIX:
-                if not table.endswith(suffix):
-                    ret_tables.add(table)
-    else:
-        if db not in environment_specific.NONSHARDED_IGNORABLE_DBS:
-            ret_tables = tables
+    priority_tables = list()
+    normal_tables = list()
 
-    return ret_tables
+    # if we have specific instructions about what to do with this replica
+    # set, apply those.  if not, get the sorting info based on what kind
+    # of data is stored here.  Assume non-sharded data.
+    #
+    prefix = instance.hostname_prefix
+    filters = environment_specific.CSV_BACKUP_MODIFIER_MAP[environment_specific.NONSHARDED]
+    if prefix in environment_specific.CSV_BACKUP_MODIFIER_MAP:
+        filters = environment_specific.CSV_BACKUP_MODIFIER_MAP[prefix]
+    else:
+        if prefix in environment_specific.SHARDED_DBS_PREFIX:
+            filters = environment_specific.CSV_BACKUP_MODIFIER_MAP[environment_specific.SHARDED]
+        elif prefix in environment_specific.FLEXSHARD_DBS:
+            filters = environment_specific.CSV_BACKUP_MODIFIER_MAP[environment_specific.FLEXSHARD]
+
+    # compile our regex outside the main loop.
+    skip_regex = list()
+    priority_regex = list()
+    for skip in filters['skipped_tables']:
+        p = re.compile(skip)
+        skip_regex.append(p)
+
+    for pri in filters['priority_tables']:
+        p = re.compile(pri)
+        priority_regex.append(p)
+
+    # iterate through the table set and apply the appropriate filters.
+    for table in table_set:
+        skip_table = False
+        priority_table = False
+        for skip in skip_regex:
+            if skip.match(table):
+                skip_table = True
+                break
+
+        # if the table didn't match one of our skip filters, does it
+        # match a priority filter?
+        #
+        if not skip_table:
+            for pri in priority_regex:
+                if pri.match(table):
+                    priority_table = True
+                    break
+
+            # before we add the table to the appropriate list, we have to
+            # find out if it is partitioned, and if so, add the partitions
+            # instead.
+            #
+            partition_count = 0
+            for p in mysql_lib.get_partitions_for_table(instance, *table.split('.')):
+                if priority_table:
+                    priority_tables.append((table, p, partition_count))
+                else:
+                    normal_tables.append((table, p, partition_count))
+                partition_count = partition_count+1
+
+    # so, the list of things to dump in the order we want to dump them
+    # is the concatenation of the priority list and the normal list,
+    # so we just add the normal list onto the end of the priority list.
+    # this: sorted(normal_tables, key=lambda x: x[0])) seems to make
+    # things slower, so we'll just tack on the tables without sorting.
+    # 
+    priority_tables.extend(normal_tables)
+    return priority_tables

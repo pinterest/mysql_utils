@@ -104,7 +104,7 @@ def restore_instance(backup_type, restore_source, destination,
 
     # Take a lock to prevent multiple restores from running concurrently
     log.info('Taking a lock to block another restore from starting')
-    lock_handle = host_utils.bind_lock_socket(backup.BACKUP_LOCK_SOCKET)
+    lock_handle = host_utils.bind_lock_socket(backup.STD_BACKUP_LOCK_SOCKET)
 
     log.info('Looking for a backup to restore')
     if restore_source:

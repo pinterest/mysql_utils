@@ -486,6 +486,61 @@ def does_table_exist(instance, db, table):
     return table_exists
 
 
+def get_all_tables_by_instance(instance):
+    """ Get a list of all of the tables on a given instance in all of
+        the databases that we might be able to dump.  We intentionally
+        omit anything that isn't InnoDB or MyISAM.
+
+    Args:
+        instance: a hostAddr object
+    Returns:
+        A set of fully-qualified table names.
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    result = set()
+
+    sql = ("SELECT CONCAT(TABLE_SCHEMA, '.', TABLE_NAME) AS tbl FROM "
+           "information_schema.tables WHERE TABLE_TYPE='BASE TABLE' "
+           "AND ENGINE IN ('InnoDB', 'MyISAM')")
+
+    cursor.execute(sql)
+    for t in cursor.fetchall():
+        result.add(t['tbl'])
+    return result
+
+
+def get_partitions_for_table(instance, db, table):
+    """ Get a list of all partitions for a given table, if there are
+        any.  Return them in a list.  We do not support subpartitions
+
+        Args:
+            instance - a hostAddr object
+            db - A string containing the database name
+            table - The table to investigate
+        Returns:
+            partition_list: A list of partition names, if there are any.
+                            Otherwise, a one-element list containing 'None'.
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    param = {'db': db,
+             'tbl': table}
+    partition_list = list()
+
+    sql = ("SELECT DISTINCT PARTITION_NAME AS p FROM "
+           "information_schema.partitions WHERE TABLE_SCHEMA=%(db)s "
+           "AND TABLE_NAME=%(tbl)s AND PARTITION_NAME IS NOT NULL")
+    cursor.execute(sql, param)
+    for row in cursor.fetchall():
+        partition_list.append(row['p'])
+
+    if len(partition_list) == 0:
+        partition_list.append(None)
+
+    return partition_list
+
+
 def get_tables(instance, db, skip_views=False):
     """ Get a list of tables and views in a given database or just
         tables.  Default to include views so as to maintain backward
@@ -1595,21 +1650,21 @@ def set_global_variable(instance, variable, value, check_existence=False):
     return True
 
 
-def start_consistent_snapshot(conn, read_only=False):
+def start_consistent_snapshot(conn, read_only=False, session_id=None):
     """ Start a transaction with a consistent view of data
 
     Args:
-    instance - a hostAddr object
-    read_only - see the transaction to be read_only
+        instance - a hostAddr object
+        read_only - set the transaction to be read_only
+        session_id - a MySQL session ID to base the snapshot on
     """
-    if read_only:
-        read_write_mode = 'READ ONLY'
-    else:
-        read_write_mode = 'READ WRITE'
+    read_write_mode = 'READ ONLY' if read_only else 'READ WRITE'
+    session = 'FROM SESSION {}'.format(session_id) if session_id else ''
     cursor = conn.cursor()
     cursor.execute("SET SESSION TRANSACTION ISOLATION "
                    "LEVEL REPEATABLE READ")
-    cursor.execute("START TRANSACTION /*!50625 WITH CONSISTENT SNAPSHOT, {rwm} */".format(rwm=read_write_mode))
+    cursor.execute("START TRANSACTION /*!50625 WITH CONSISTENT SNAPSHOT "
+                   "{s}, {rwm} */".format(s=session, rwm=read_write_mode))
 
 
 def get_long_trx(instance):

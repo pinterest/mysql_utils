@@ -105,7 +105,7 @@ def already_uploaded(instance, binlog, logged_uploads):
     binlog - the full path to the binlog file
     logged_uploads - a set of all uploaded binlogs for this instance
 
-    Returns True if already uplaoded, False otherwise.
+    Returns True if already uploaded, False otherwise.
     """
     if os.path.basename(binlog) in logged_uploads:
         log.debug('Binlog already logged as uploaded')

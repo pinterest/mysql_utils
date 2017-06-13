@@ -125,7 +125,18 @@ def verify_flexsharded_csv_backup(shard_type, date, dev_bucket=False):
                 chk_instance = zk.get_mysql_instance_from_replica_set(replica_set)
                 (_, data_path, success_path) = backup.get_csv_backup_paths(
                                                    chk_instance, db, table, date)
-                if not bucket.get_key(data_path):
+
+                k = bucket.get_key(data_path)
+                if k is None:
+                    table_missing_uploads.add(data_path)
+                    success = False
+                elif k.size == 0:
+                    # we should not have zero-length files, because even if
+                    # we send zero bytes to lzop, there's a 55-byte header.
+                    # so, if this actually happened, it probably means that
+                    # something is wrong.  delete the key and add it to the
+                    # missing_uploads list so that we'll try again.
+                    k.delete()
                     table_missing_uploads.add(data_path)
                     success = False
 
@@ -133,7 +144,7 @@ def verify_flexsharded_csv_backup(shard_type, date, dev_bucket=False):
                 print 'Creating success key {b}/{k}'.format(b=bucket_name,
                                                             k=success_path)
                 key = bucket.new_key(success_path)
-                key.set_contents_from_string('')
+                key.set_contents_from_string(' ')
 
             missing_uploads.update(table_missing_uploads)
 
@@ -204,7 +215,7 @@ def verify_sharded_csv_backup_by_shard_type(shard_type, date,
                 print 'Creating success key {b}/{k}'.format(b=bucket_name,
                                                             k=success_path)
                 key = bucket.new_key(success_path)
-                key.set_contents_from_string('')
+                key.set_contents_from_string(' ')
         print 'Shard type {} is backed up'.format(shard_type)
 
     return True
@@ -268,7 +279,12 @@ def get_sharded_db_missing_uploads(args):
     bucket = boto_conn.get_bucket(bucket_name, validate=False)
     uploaded_keys = set()
     for key in bucket.list(prefix=prefix):
-        uploaded_keys.add(key.name)
+        if key.size > 0:
+            uploaded_keys.add(key.name)
+        elif key.name.split('/')[-1][0] != '_':
+            # If we have a zero-length file that doesn't start with
+            # an underscore, it shouldn't be here.
+            key.delete()
 
     missing_uploads = expected_s3_keys.difference(uploaded_keys)
 
@@ -276,7 +292,8 @@ def get_sharded_db_missing_uploads(args):
         # The list API occassionally has issues, so we will recheck any missing
         # entries. If any are actually missing we will quit checking because
         # there is definitely work that needs to be done
-        if bucket.get_key(entry):
+        k = bucket.get_key(entry)
+        if k and k.size > 0:
             print 'List method did not return data for key:{}'.format(entry)
             missing_uploads.discard(entry)
         else:
@@ -381,7 +398,16 @@ def verify_unsharded_csv_backups(instance, date, dev_bucket=False):
         for table in tables:
             (_, data_path, success_path) = \
                 backup.get_csv_backup_paths(instance, db, table, date)
-            if not bucket.get_key(data_path):
+            k = bucket.get_key(data_path)
+            if k is None:
+                missing_uploads.add(data_path)
+            elif k.size == 0:
+                # we should not have zero-length files, because even if
+                # we send zero bytes to lzop, there's a 55-byte header.
+                # so, if this actually happened, it probably means that
+                # something is wrong.  delete the key and add it to the
+                # missing_uploads list so that we'll try again.
+                k.delete()
                 missing_uploads.add(data_path)
             else:
                 # We still need to create a success file for the data
@@ -394,7 +420,7 @@ def verify_unsharded_csv_backups(instance, date, dev_bucket=False):
                     print 'Creating success key {b}/{k}'.format(b=bucket_name,
                                                                 k=success_path)
                     key = bucket.new_key(success_path)
-                    key.set_contents_from_string('')
+                    key.set_contents_from_string(' ')
 
     if missing_uploads:
         if len(missing_uploads) < MISSING_BACKUP_VERBOSE_LIMIT:
@@ -446,7 +472,7 @@ def csv_backups_running(instance):
     Returns:
     True if backups are running, False otherwise
     """
-    (dump_user, 
+    (dump_user,
      _) = mysql_lib.get_mysql_user_for_role(backup.USER_ROLE_MYSQLDUMP)
     zk = host_utils.MysqlZookeeper()
     replica_set = zk.get_replica_set_from_instance(instance)
@@ -648,10 +674,15 @@ def main():
 
             for shard_type in all_sharded_systems:
                 # If there are any problems, we return BACKUP_MISSING_RETURN
-                if not verify_csv_full_sharded_systems_backup(shard_type,
+                # don't stop here but continue moving on another check
+                try:
+                    if not verify_csv_full_sharded_systems_backup(shard_type,
                                                               date,
                                                               args.dev_bucket):
-                    return_code = BACKUP_MISSING_RETURN
+                        return_code = BACKUP_MISSING_RETURN
+                except Exception as e:
+                    print e
+                    continue
         elif args.shard_type:
             # Same as above, but only one specified shard_type
             if not verify_csv_full_sharded_systems_backup(args.shard_type,

@@ -290,7 +290,9 @@ def get_master_status(instance):
     {'Binlog_Do_DB': '',
      'Binlog_Ignore_DB': '',
      'File': 'mysql-bin.019324',
-     'Position': 61559L}
+     'Position': 61559L,
+     'Executed_Gtid_Set': 'b27a8edf-eca1-11e6-99e4-0e695f0e3b16:1-151028417'
+    }
     """
     conn = connect_mysql(instance)
     cursor = conn.cursor()
@@ -521,6 +523,28 @@ def get_columns_for_table(instance, db, table):
         ret.append(column['COLUMN_NAME'])
 
     return ret
+
+
+def setup_audit_plugin(instance):
+    """ Install the audit log plugin.  Similarly to semisync, we may
+        or may not use it, but we need to make sure that it's available.
+        Audit plugin is available on 5.5 and above, which are all the
+        versions we support.
+
+        Args:
+        instance - A hostaddr object
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("INSTALL PLUGIN audit_log SONAME 'audit_log.so'")
+    except MySQLdb.OperationalError as detail:
+        (error_code, msg) = detail.args
+        # plugin already loaded, nothing to do.
+        if error_code != MYSQL_ERROR_FUNCTION_EXISTS:
+            raise
+    conn.close()
 
 
 def setup_semisync_plugins(instance):
@@ -881,20 +905,23 @@ def stop_event_scheduler(instance):
         warnings.resetwarnings()
 
 
-def setup_replication(new_master, new_replica):
+def setup_replication(new_master, new_replica, auto_pos=True):
     """ Set an instance as a slave of another
 
     Args:
     new_master - A hostaddr object for the new master
     new_slave - A hostaddr object for the new slave
+    auto_pos - Do we want GTID auto positioning (if GTID is enabled)?
     """
     log.info('Setting {new_replica} as a replica of new master '
              '{new_master}'.format(new_master=new_master,
                                    new_replica=new_replica))
+
     new_master_coordinates = get_master_status(new_master)
     change_master(new_replica, new_master,
                   new_master_coordinates['File'],
-                  new_master_coordinates['Position'])
+                  new_master_coordinates['Position'],
+                  gtid_auto_pos=auto_pos)
 
 
 def restart_replication(instance):
@@ -991,8 +1018,24 @@ def reset_slave(instance):
         pass
 
 
+def reset_master(instance):
+    """ Clear the binlogs and any GTID information that may exist.
+        We may have to do this when setting up a new slave.
+
+    Args:
+    instance - A hostAddr object
+    """
+    conn = connect_mysql(instance)
+    cursor = conn.cursor()
+    cmd = 'RESET MASTER'
+    log.info(cmd)
+    cursor.execute(cmd)
+    conn.close()
+
+
 def change_master(slave_hostaddr, master_hostaddr, master_log_file,
-                  master_log_pos, no_start=False, skip_set_readonly=False):
+                  master_log_pos, no_start=False, skip_set_readonly=False,
+                  gtid_purged=None, gtid_auto_pos=True):
     """ Setup MySQL replication on new replica
 
     Args:
@@ -1002,6 +1045,10 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
     master_log_pos - Position in master_log_file
     no_start - If set, don't run START SLAVE after CHANGE MASTER
     skip_set_readonly - If set, don't set read-only flag
+    gtid_purged - A set of GTIDs that we have already applied,
+                  if we're in GTID mode.
+    gtid_auto_pos - If set, use GTID auto-positioning if we're also
+                    in GTID mode.
     """
     conn = connect_mysql(slave_hostaddr)
     cursor = conn.cursor()
@@ -1011,19 +1058,53 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
 
     reset_slave(slave_hostaddr)
     master_user, master_password = get_mysql_user_for_role('replication')
+
     parameters = {'master_user': master_user,
                   'master_password': master_password,
                   'master_host': master_hostaddr.hostname,
                   'master_port': master_hostaddr.port,
                   'master_log_file': master_log_file,
                   'master_log_pos': master_log_pos}
-    sql = ''.join(("CHANGE MASTER TO "
-                   "MASTER_USER=%(master_user)s, "
-                   "MASTER_PASSWORD=%(master_password)s, "
-                   "MASTER_HOST=%(master_host)s, "
-                   "MASTER_PORT=%(master_port)s, "
-                   "MASTER_LOG_FILE=%(master_log_file)s, "
-                   "MASTER_LOG_POS=%(master_log_pos)s "))
+
+    sql_base = ("CHANGE MASTER TO "
+                "MASTER_USER=%(master_user)s, "
+                "MASTER_PASSWORD=%(master_password)s, "
+                "MASTER_PORT=%(master_port)s, "
+                "MASTER_HOST=%(master_host)s, "
+                "{extra}")
+
+    # are we in a GTID-based cluster - i.e., both master and slave
+    # have GTID enabled?  If so, we need a slightly different SQL
+    # statement.
+    master_globals = get_global_variables(master_hostaddr)
+    slave_globals = get_global_variables(slave_hostaddr)
+    if master_globals['version'] >= '5.6' and slave_globals['version'] >= '5.6':
+        use_gtid = master_globals['gtid_mode'] == 'ON' and \
+                   slave_globals['gtid_mode'] == 'ON'
+    else:
+        # GTID not supported at all.
+        use_gtid = None
+
+    # if GTID is enabled but gtid_auto_pos is not set, we don't use
+    # auto-positioning.  This will only happen in the case of a
+    # shard migration / partial failover, which means that we're
+    # taking a master and temporarily making it a slave.
+    if use_gtid and gtid_auto_pos:
+        sql = sql_base.format(extra='MASTER_AUTO_POSITION=1')
+        del parameters['master_log_file']
+        del parameters['master_log_pos']
+
+        if gtid_purged:
+            cursor.execute("SET GLOBAL gtid_purged=%(gtid_purged)s",
+                           {'gtid_purged': gtid_purged})
+            log.info(cursor._executed)
+    else:
+        extra = ("MASTER_LOG_FILE=%(master_log_file)s, "
+                 "MASTER_LOG_POS=%(master_log_pos)s")
+        if use_gtid is not None:
+            extra = extra + ", MASTER_AUTO_POSITION=0"
+        sql = sql_base.format(extra=extra)
+
     warnings.filterwarnings('ignore', category=MySQLdb.Warning)
     cursor.execute(sql, parameters)
     warnings.resetwarnings()
@@ -1036,6 +1117,80 @@ def change_master(slave_hostaddr, master_hostaddr, master_log_file,
         # Avoid race conditions for zk update monitor
         assert_replication_sanity(slave_hostaddr,
                                   set([CHECK_SQL_THREAD, CHECK_IO_THREAD]))
+
+
+def find_errant_trx(source, reference):
+    """ If this is a GTID cluster, determine if this slave has any errant
+        transactions.  If it does, we can't promote it until we fix them.
+
+        Args:
+            source: the source instance to check
+            reference: the instance to compare to.  it may be a master,
+                       or it may be another slave in the same cluster.
+        Returns:
+            A list of errant trx, or None if there aren't any.
+    """
+    ss = get_master_status(source)
+    errant_trx = list()
+
+    if ss.get('Executed_Gtid_Set'):
+        source_gtid_dict = {y.split(':')[0]: ':'.join(y.split(':')[1:])
+                            for y in [x.strip()
+                            for x in ss['Executed_Gtid_Set'].split(',')]}
+
+        rs = get_master_status(reference)
+        ref_gtid_dict = {y.split(':')[0]: ':'.join(y.split(':')[1:])
+                         for y in [x.strip()
+                         for x in rs['Executed_Gtid_Set'].split(',')]}
+
+        source_uuid_set = set(source_gtid_dict.keys())
+        ref_uuid_set = set(ref_gtid_dict.keys())
+
+        for server_id in source_uuid_set - ref_uuid_set:
+            errant_trx.append('{}:{}'.format(server_id,
+                                             source_gtid_dict[server_id]))
+    return errant_trx
+
+
+def fix_errant_trx(gtid_list, target_instance, is_master=True):
+    """ We have a set of GTIDs that don't belong.  Try to fix them.
+        Args:
+            gtid_list: A list of GTIDs
+            target_instance: The hostaddr of the instance to use
+            is_master: Is this a master?
+        Returns:
+            Nothing - either it works or it fails.
+    """
+    conn = connect_mysql(target_instance)
+    cursor = conn.cursor()
+
+    # not a master, we don't need to write these to the binlog.
+    if not is_master:
+        cursor.execute('SET SESSION sql_log_bin=0')
+
+    sql = 'SET GTID_NEXT=%(gtid)s'
+
+    # AFAIK, there is no 'bulk' way to do this.
+    for gtid in gtid_list:
+        (uuid, trx_list) = gtid.split(':', 1)
+        for trx in trx_list.split(':'):
+            try:
+                # it's a range.
+                (start, end) = trx.split('-')
+            except ValueError:
+                # it's just a single transaction.
+                (start, end) = (trx, trx)
+
+            for i in xrange(int(start), int(end)+1):
+                injected_trx = '{}:{}'.format(uuid, i)
+                cursor.execute(sql, {'gtid': injected_trx})
+                log.info(cursor._executed)
+                conn.commit()
+                cursor.execute('SET GTID_NEXT=AUTOMATIC')
+
+    if not is_master:
+        cursor.execute('SET SESSION sql_log_bin=1')
+    conn.close()
 
 
 def wait_for_catch_up(slave_hostaddr, io=False, migration=False):
@@ -1370,31 +1525,45 @@ def get_pitr_data(instance):
     return ret
 
 
-def set_global_variable(instance, variable, value):
+def set_global_variable(instance, variable, value, check_existence=False):
     """ Modify MySQL global variables
 
     Args:
     instance - a hostAddr object
     variable - a string the MySQL global variable name
     value - a string or bool of the deisred state of the variable
+    check_existence - verify that the desired variable exists before
+                      we try to set it.  if the existence check fails,
+                      we output a warning message and return False.
+                      Most of the time we don't care, but for things
+                      that are version-specific, we might.
+    Returns:
+        True or False
     """
+
     conn = connect_mysql(instance)
     cursor = conn.cursor()
+    gvars = get_global_variables(instance)
+
+    if check_existence and variable not in gvars:
+        log.warning("{} is not a valid variable name for this MySQL "
+                    "instance".format(variable))
+        return False
 
     # If we are enabling read only we need to kill all long running trx
     # so that they don't block the change
     if (variable == 'read_only' or variable == 'super_read_only') and value:
-        gvars = get_global_variables(instance)
         if 'super_read_only' in gvars and gvars['super_read_only'] == 'ON':
             # no use trying to set something that is already turned on
-            return
+            return True
         kill_long_trx(instance)
 
     parameters = {'value': value}
     # Variable is not a string and can not be paramaretized as per normal
-    sql = 'SET GLOBAL {variable} = %(value)s'.format(variable=variable)
+    sql = 'SET GLOBAL {} = %(value)s'.format(variable)
     cursor.execute(sql, parameters)
     log.info(cursor._executed)
+    return True
 
 
 def start_consistent_snapshot(conn, read_only=False):
@@ -1448,7 +1617,7 @@ def kill_user_queries(instance, username):
     cursor = conn.cursor()
     sql = ("SELECT id "
            "FROM information_schema.processlist "
-           "WHERE user= %(username)s ")
+           "WHERE user=%(username)s ")
     cursor.execute(sql, {'username': username})
     queries = cursor.fetchall()
     for query in queries:

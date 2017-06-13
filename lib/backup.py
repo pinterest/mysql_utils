@@ -684,16 +684,28 @@ def apply_log(datadir, memory=None):
 
 
 def parse_xtrabackup_slave_info(port):
-    """ Pull master_log and master_log_pos from a xtrabackup_slave_info file
-    NOTE: This file has its data as a CHANGE MASTER command. Example:
+    """ Pull master_log, master_log_pos, or gtid_purged from the
+    xtrabackup_slave_info file
+
+    NOTE: This file has its data as a CHANGE MASTER command and may also have
+    a list of GTID sets that have been seen.  With no GTID, we have this:
     CHANGE MASTER TO MASTER_LOG_FILE='mysql-bin.006233', MASTER_LOG_POS=863
+
+    With GTID, we have this:
+    SET GLOBAL gtid_purged='b27a8edf-eca1-11e6-99e4-0e695f0e3b16:1-3862';
+    CHANGE MASTER TO MASTER_AUTO_POSITION=1
 
     Args:
     port - the port of the instance on localhost
 
     Returns:
-    binlog_file - Binlog file to start reading from
-    binlog_pos - Position in binlog_file to start reading
+        binlog_file - Binlog file to start reading from
+        binlog_pos - Position in binlog_file to start reading
+        gtid_purged - The gtid sets that have been applied to this data
+
+    NOTE: If the backup comes from a non-GTID server, only file and pos
+          will be populated.  If it's from a GTID server, only the purge
+          list will be populated.
     """
     datadir = host_utils.get_cnf_setting('datadir', port)
     file_path = os.path.join(datadir, 'xtrabackup_slave_info')
@@ -702,21 +714,37 @@ def parse_xtrabackup_slave_info(port):
 
     file_pattern = ".*MASTER_LOG_FILE='([a-z0-9-.]+)'.*"
     pos_pattern = ".*MASTER_LOG_POS=([0-9]+).*"
-    res = re.match(file_pattern, data)
-    binlog_file = res.group(1)
-    res = re.match(pos_pattern, data)
-    binlog_pos = int(res.group(1))
+    gtid_pattern = ".*gtid_purged='([a-z0-9-:,\s]+)';.*"
+    res = re.match(gtid_pattern, data)
 
-    log.info('Master info: binlog_file: {binlog_file},'
-             ' binlog_pos: {binlog_pos}'.format(binlog_file=binlog_file,
-                                                binlog_pos=binlog_pos))
-    return (binlog_file, binlog_pos)
+    if res:
+        # this is GTID-style replication.  we check for this first.
+        gtid_purged = res.group(1)
+        log.info('Master info: GTID purged: {}'.format(gtid_purged))
+        return(None, None, gtid_purged)
+    else:
+        # and this is coordinate-style replication
+        res = re.match(file_pattern, data)
+        binlog_file = res.group(1)
+        res = re.match(pos_pattern, data)
+        binlog_pos = int(res.group(1))
+
+        log.info('Master info: binlog_file: {binlog_file},'
+                 ' binlog_pos: {binlog_pos}'.format(binlog_file=binlog_file,
+                                                    binlog_pos=binlog_pos))
+        return (binlog_file, binlog_pos, None)
 
 
 def parse_xtrabackup_binlog_info(port):
-    """ Pull master_log and master_log_pos from a xtrabackup_slave_info file
-    Note: This file stores its data as two strings in a file
-          deliminted by a tab. Example: "mysql-bin.006231\t1619"
+    """ Pull master_log, master_log_pos, and, optionally, GTID purged
+        from an xtrabackup_binlog_info file
+
+    Note: This file stores its data as two strings in a file delimited
+          by a tab if we're in non-GTID mode.  If we're in GTID mode,
+          we'll have 3 strings tab-delimited and possibly additional
+          lines of other GTID sets.
+          Example: "mysql-bin.006231\t1619" if there are no GTIDs, or
+          "mysql-bin.001234\tUUID:trx,\nUUID:trx" if there are.
 
     Args:
     port - the port of the instance on localhost
@@ -724,6 +752,7 @@ def parse_xtrabackup_binlog_info(port):
     Returns:
     binlog_file - Binlog file to start reading from
     binlog_pos - Position in binlog_file to start reading
+    gtid_purged - Purged GTID sets
     """
     datadir = host_utils.get_cnf_setting('datadir', port)
     file_path = os.path.join(datadir, 'xtrabackup_binlog_info')
@@ -731,16 +760,19 @@ def parse_xtrabackup_binlog_info(port):
         data = f.read()
 
     fields = data.strip().split("\t")
-    if len(fields) != 2:
-        raise Exception(('Error: Invalid format in '
-                         'file {file_path}').format(file_path=file_path))
+    if len(fields) != 2 and len(fields) != 4:
+        raise Exception(('Error: Invalid format in file {}').format(file_path))
     binlog_file = fields[0].strip()
     binlog_pos = int(fields[1].strip())
+    gtid_purged = fields[3].replace('\n', ' ').strip() \
+                    if len(fields) > 2 else None
 
     log.info('Master info: binlog_file: {binlog_file},'
-             ' binlog_pos: {binlog_pos}'.format(binlog_file=binlog_file,
-                                                binlog_pos=binlog_pos))
-    return (binlog_file, binlog_pos)
+             ' binlog_pos: {binlog_pos},'
+             ' gtid_purged_set: {g}'.format(binlog_file=binlog_file,
+                                            binlog_pos=binlog_pos,
+                                            g=gtid_purged))
+    return (binlog_file, binlog_pos, gtid_purged)
 
 
 def pre_exec():

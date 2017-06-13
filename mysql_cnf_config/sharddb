@@ -2,3 +2,7 @@
 default_storage_engine=InnoDB
 remove_enforce_storage_engine=InnoDB
 binlog_format = ROW
+# gtid_deployment_step = ON
+# gtid_mode = ON
+# enforce_gtid_consistency = ON
+# binlog_gtid_simple_recovery = 1

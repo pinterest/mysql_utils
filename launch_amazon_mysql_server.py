@@ -26,6 +26,9 @@ def main():
     parser.add_argument('--availability_zone',
                         choices=environment_specific.SUPPORTED_AZ,
                         required=True)
+    parser.add_argument('--ssh_group',
+                        default=None,
+                        choices=environment_specific.SSH_IAM_MAPPING.keys())
     parser.add_argument('--mysql_major_version',
                         choices=environment_specific.SUPPORTED_MYSQL_MAJOR_VERSIONS,
                         default=launch_replacement_db_host.DEFAULT_MYSQL_MAJOR_VERSION,
@@ -50,6 +53,7 @@ def main():
                                instance_type=args.instance_type,
                                vpc_security_group=args.vpc_security_group,
                                availability_zone=args.availability_zone,
+                               ssh_group=args.ssh_group,
                                mysql_major_version=args.mysql_major_version,
                                mysql_minor_version=args.mysql_minor_version,
                                os_flavor=args.os_flavor,
@@ -57,8 +61,9 @@ def main():
 
 
 def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
-                               availability_zone, mysql_major_version, mysql_minor_version,
-                               os_flavor, dry_run, skip_name_check=False):
+                               availability_zone, ssh_group, mysql_major_version,
+                               mysql_minor_version, os_flavor, dry_run,
+                               skip_name_check=False):
     """ Launch a mysql server in aws
 
     Args:
@@ -66,6 +71,7 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
     instance_type - hardware type
     vpc_security_group - VPC firewall rules.
     availability_zone - AWS availability zone
+    ssh_group - What IAM/SSH zone to use
     mysql_major_version - MySQL major version. Example 5.5 or 5.6
     mysql_minor_version - Which "branch" to use. Values are 'stable', 'staging'
                           and 'latest'.
@@ -93,9 +99,19 @@ def launch_amazon_mysql_server(hostname, instance_type, vpc_security_group,
 
     (subnet_name, config['subnet_id']) = get_subnet_from_sg(vpc_security_group,
                                                             availability_zone)
+
     ssh_security = environment_specific.SSH_SECURITY_MAP[subnet_name]['ssh']
     config['instance_profile_name'] = environment_specific.SSH_SECURITY_MAP[subnet_name]['iam']
     config['security_group_ids'] = [environment_specific.VPC_SECURITY_GROUPS[vpc_security_group]]
+
+    if ssh_group:
+        if ssh_group >= ssh_security and ssh_group in environment_specific.SSH_IAM_MAPPING.keys():
+            ssh_security = ssh_group
+            config['instance_profile_name'] = environment_specific.SSH_IAM_MAPPING[ssh_group]
+        else:
+            raise Exception("We are not allowed to provision a host in {0} env "
+                            "with a weaker access policy than {1} it's existing or default "
+                            "config".format(ssh_group, ssh_security))
 
     hiera_config = environment_specific.HIERA_FORMAT.format(
         ssh_security=ssh_security,

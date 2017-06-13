@@ -17,7 +17,7 @@ MIN_CMDB_RESULTS = 100
 RESET_STATS = 'Reset statistics'
 SHUTDOWN_MYSQL = 'Shutdown MySQL'
 TERMINATE_INSTANCE = 'Terminate instance'
-IGNORABLE_USERS = set(["admin", "ptkill", "monit",
+IGNORABLE_USERS = set(["admin", "ptkill", "monit", "dbascript",
                        "#mysql_system#", 'ptchecksum',
                        "replicant", "root", "heartbeat", "system user"])
 
@@ -226,6 +226,9 @@ def process_mysql_shutdown(hostname=None, dry_run=False):
 
         try:
             if check_for_user_activity(shutdown_instances[instance]):
+                log.info('Activity detected on {}, removing from queue'
+                         ''.format(instance))
+                remove_from_retirement_queue(hostname)
                 continue
             else:
                 log.info('Shutting down mysql on {}'.format(instance))
@@ -279,8 +282,10 @@ def terminate_instances(hostname=None, dry_run=False):
                     user=username,
                     passwd=password,
                     cursorclass=MySQLdb.cursors.DictCursor)
-            log.error('Did not get MYSQL_ERROR_CONN_HOST_ERROR')
+            log.error('Did not get MYSQL_ERROR_CONN_HOST_ERROR, removing {} '
+                      'from queue'.format(hostname))
             conn.close()
+            remove_from_retirement_queue(hostname)
             continue
         except MySQLdb.OperationalError as detail:
             (error_code, msg) = detail.args

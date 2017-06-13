@@ -156,9 +156,10 @@ def start_shard_migration(source_replica_set, destination_replica_set,
     log.info('Import metadata')
     mysql_restore.logical_restore(metadata_backup, destination_master)
 
-    log.info('Setting up replicaiton')
+    log.info('Setting up replication')
     mysql_lib.change_master(destination_master, source_master,
-                            'BOGUS', 0, no_start=True, skip_set_readonly=True)
+                            'BOGUS', 0, no_start=True, skip_set_readonly=True,
+                            gtid_auto_pos=False)
     mysql_restore.logical_restore(mig_backup, destination_master)
 
     # add start slave, catchup

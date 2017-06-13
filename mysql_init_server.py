@@ -53,7 +53,7 @@ def main():
 
 
 def mysql_init_server(instance,
-                      skip_production_check=False, 
+                      skip_production_check=False,
                       skip_backup=True, lock_handle=None):
     """ Remove any data and initialize a MySQL instance
 
@@ -105,6 +105,9 @@ def mysql_init_server(instance,
         log.info('Starting up instance')
         host_utils.start_mysql(instance.port)
 
+#        log.info('Disabling super_read_only if necessary')
+#        mysql_lib.set_global_variable(instance, 'super_read_only', False, True)
+
         log.info('Importing MySQL users')
         mysql_grants.manage_mysql_grants(instance, 'nuke_then_import')
 
@@ -116,6 +119,9 @@ def mysql_init_server(instance,
 
         log.info('Setting up semi-sync replication plugins')
         mysql_lib.setup_semisync_plugins(instance)
+
+        log.info('Setting up audit log plugin')
+        mysql_lib.setup_audit_plugin(instance)
 
         log.info('Restarting pt daemons')
         host_utils.restart_pt_daemons(instance.port)

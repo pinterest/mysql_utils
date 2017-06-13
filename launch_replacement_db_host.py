@@ -59,6 +59,11 @@ def main():
                         help=('Do not derive a hostname, use supplied '
                               'hostname instead.'),
                         default=None)
+    parser.add_argument('--override_ssh_group',
+                        help=('Which SSH group to assign host to. Do not '
+                              'replace with an instance in lower ssh policy'),
+                        choices=environment_specific.SSH_IAM_MAPPING.keys(),
+                        default=None)
     parser.add_argument('--override_hw',
                         help=('Do not replace with an instance of the same '
                               'instance type, instead use the supplied '
@@ -79,7 +84,7 @@ def main():
                         # default is set in the underlying function
                         default=None)
     parser.add_argument('--override_os_flavor',
-                        help="Which flavor of OS to target.  Default is 'precise'",
+                        help="Which flavor of OS to target. Default is 'trusty' ",
                         choices=environment_specific.SUPPORTED_OS_FLAVORS,
                         default=None)
     parser.add_argument('--override_vpc_security',
@@ -96,7 +101,8 @@ def main():
                  'mysql_major_version': args.override_mysql_major_version,
                  'mysql_minor_version': args.override_mysql_minor_version,
                  'vpc_security_group': args.override_vpc_security,
-                 'os_flavor': args.override_os_flavor}
+                 'os_flavor': args.override_os_flavor,
+                 'ssh_group': args.override_ssh_group}
 
     launch_replacement_db_host(original_server=host_utils.HostAddr(args.server),
                                dry_run=args.dry_run,
@@ -208,6 +214,7 @@ def launch_replacement_db_host(original_server,
                           'mysql_major_version': mysql_lib.get_global_variables(version_server)['version'][0:3],
                           'mysql_minor_version': DEFAULT_MYSQL_MINOR_VERSION,
                           'os_flavor': cmdb_data['facts.lsbdistcodename'] or DEFAULT_OS_FLAVOR,
+                          'ssh_group': cmdb_data['facts.pinfo_role'].split("_")[-1],
                           'dry_run': dry_run,
                           'skip_name_check': True}
 

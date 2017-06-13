@@ -48,6 +48,7 @@ UPGRADE_OVERRIDE_SETTINGS = {'skip_slave_start': None,
                              'innodb_fast_shutdown': '0'}
 UPGRADE_REMOVAL_SETTINGS = set(['enforce_storage_engine',
                                 'init_file',
+                                'super_read_only',
                                 'disabled_storage_engines'])
 
 
@@ -136,8 +137,15 @@ def build_cnf(host=None,
     log.info('Setting server_id to {}'.format(server_id))
     parser.set(MYSQLD_SECTION, 'server_id', server_id)
 
-    # Set read_only based upon service discovery
-    parser.set(MYSQLD_SECTION, 'read_only', config_read_only(host))
+    # Set read_only or super_read_only based upon service discovery
+    # if super_read_only is enabled, read_only is enabled by extension.
+    # if read_only is disabled, super_read_only is disabled by extension.
+    # note that we have to remember to disable SRO at various points during
+    # server initialization.
+    ro_status = config_read_only(host)
+    parser.set(MYSQLD_SECTION, 'read_only', ro_status)
+#    if major_version >= '5.6':
+#        parser.set(MYSQLD_SECTION, 'super_read_only', ro_status)
 
     # If needed, turn on safe updates via an init_file
     create_init_sql(host.hostname_prefix, parser, override_dir)

@@ -119,7 +119,7 @@ def restore_instance(backup_type, restore_source, destination,
     try:
         replica_set = restore_source.get_zk_replica_set()
         master = zk.get_mysql_instance_from_replica_set(replica_set,
-                    host_utils.REPLICA_ROLE_MASTER)
+                                                        host_utils.REPLICA_ROLE_MASTER)
     except:
         # ZK has no idea what this replica set is, probably a new replica set.
         master = restore_source
@@ -148,20 +148,30 @@ def restore_instance(backup_type, restore_source, destination,
                         skip_backup=True,
                         lock_handle=lock_handle)
 
+        # make sure that super_read_only is disabled.
+        mysql_lib.set_global_variable(destination, 'super_read_only',
+                                      False, True)
+
         if backup_type == backup.BACKUP_TYPE_XBSTREAM:
             xbstream_restore(backup_key, destination.port)
             if master == restore_source:
-                log.info('Pulling replication info from restore to '
+                log.info('Pulling replication info for restore from '
                          'backup source')
                 (binlog_file,
-                 binlog_pos) = backup.parse_xtrabackup_binlog_info(
+                 binlog_pos,
+                 gtid_purged) = backup.parse_xtrabackup_binlog_info(
                                 destination.port)
             else:
-                log.info('Pulling replication info from restore to '
+                log.info('Pulling replication info for restore from '
                          'master of backup source')
+                # if our backup came from a GTID server, we won't have
+                # a binlog_file and a binlog_pos, so we need to see if
+                # we can get a set of purged GTIDs
                 (binlog_file,
-                 binlog_pos) = backup.parse_xtrabackup_slave_info(
+                 binlog_pos,
+                 gtid_purged) = backup.parse_xtrabackup_slave_info(
                                 destination.port)
+
         elif backup_type == backup.BACKUP_TYPE_LOGICAL:
             log.info('Preparing replication')
             # We are importing a mysqldump which was created with
@@ -175,6 +185,9 @@ def restore_instance(backup_type, restore_source, destination,
             # the SQL thread would start executing...
             mysql_lib.change_master(destination, master, 'BOGUS', 0,
                                     no_start=True)
+            # reset master on slave before we load anything to ensure that
+            # we can set GTID info from the backup, if it exists.
+            mysql_lib.reset_master(destination)
             logical_restore(backup_key, destination)
             host_utils.stop_mysql(destination.port)
 
@@ -185,21 +198,33 @@ def restore_instance(backup_type, restore_source, destination,
         host_utils.start_mysql(
             destination.port,
             options=host_utils.DEFAULTS_FILE_EXTRA_ARG.format(
-            defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
+                defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
+
+        # we have to do this again here, too, since we just did
+        # a restart.
+        mysql_lib.set_global_variable(destination, 'super_read_only',
+                                      False, True)
 
         # Since we haven't started the slave yet, make sure we've got these
         # plugins installed, whether we use them or not.
         mysql_lib.setup_semisync_plugins(destination)
+        mysql_lib.setup_audit_plugin(destination)
+        mysql_lib.setup_response_time_metrics(destination)
+
         restore_log_update = {'restore_status': 'OK'}
 
         # Try to configure replication.
         log.info('Setting up MySQL replication')
         restore_log_update['replication'] = 'FAIL'
         if backup_type == backup.BACKUP_TYPE_XBSTREAM:
+            # before we change master, reset master on the
+            # slave to clear out any GTID errant transactions.
+            mysql_lib.reset_master(destination)
             mysql_lib.change_master(destination,
                                     master,
                                     binlog_file,
                                     binlog_pos,
+                                    gtid_purged=gtid_purged,
                                     no_start=(no_repl == 'SKIP'))
         elif backup_type == backup.BACKUP_TYPE_LOGICAL:
             if no_repl == 'SKIP':
@@ -211,7 +236,6 @@ def restore_instance(backup_type, restore_source, destination,
         restore_log_update['replication'] = 'OK'
 
         host_utils.restart_pt_daemons(destination.port)
-        mysql_lib.setup_response_time_metrics(destination)
 
     except Exception as e:
         log.error(e)
@@ -232,7 +256,7 @@ def restore_instance(backup_type, restore_source, destination,
                 host_utils.start_mysql(
                     destination.port,
                     options=host_utils.DEFAULTS_FILE_EXTRA_ARG.format(
-                    defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
+                        defaults_file=host_utils.MYSQL_NOREPL_CNF_FILE))
             else:
                 host_utils.start_mysql(destination.port)
 
@@ -434,9 +458,13 @@ def logical_restore(dump, destination):
         log.info('Restarting MySQL to turn off enforce_storage_engine')
         host_utils.stop_mysql(destination.port)
         host_utils.start_mysql(destination.port,
-                           host_utils.DEFAULTS_FILE_ARG.format(
-                           defaults_file=host_utils.MYSQL_UPGRADE_CNF_FILE))
+                               host_utils.DEFAULTS_FILE_ARG.format(
+                                defaults_file=host_utils.MYSQL_UPGRADE_CNF_FILE))
         rate_limit = None
+
+    # make sure that super_read_only is disabled, or we won't be
+    # able to load the data.
+    mysql_lib.set_global_variable(destination, 'super_read_only', False, True)
 
     log.info('Downloading, decompressing and importing backup')
     procs = dict()
@@ -448,7 +476,7 @@ def logical_restore(dump, destination):
     procs['zcat'] = subprocess.Popen(['zcat'],
                                      stdin=procs['pv'].stdout,
                                      stdout=subprocess.PIPE)
-    mysql_cmd = ['mysql', 
+    mysql_cmd = ['mysql',
                  '--port={}'.format(str(destination.port)),
                  '--host={}'.format(destination.hostname),
                  '--user={}'.format(user),

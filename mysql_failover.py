@@ -19,6 +19,7 @@ WAIT_TIME_CONFIRM_QUIESCE = 10
 
 log = logging.getLogger(__name__)
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('instance',
@@ -44,6 +45,11 @@ def main():
                         help=('Do not take a promotion lock. Scary.'),
                         default=False,
                         action='store_true')
+    parser.add_argument('--gtid_migrate',
+                        help=('Set this flag if migrating to a GTID-based '
+                              'setup from non-GTID'),
+                        default=False,
+                        action='store_true')
     parser.add_argument('--kill_old_master',
                         help=('If we can not get the master into read_only, '
                               'send a mysqladmin kill to the old master.'),
@@ -54,11 +60,11 @@ def main():
     instance = host_utils.HostAddr(args.instance)
     mysql_failover(instance, args.dry_run, args.skip_lock,
                    args.ignore_dr_slave, args.trust_me_its_dead,
-                   args.kill_old_master)
+                   args.kill_old_master, args.gtid_migrate)
 
 
-def mysql_failover(master, dry_run, skip_lock,
-                   ignore_dr_slave, trust_me_its_dead, kill_old_master):
+def mysql_failover(master, dry_run, skip_lock, ignore_dr_slave,
+                   trust_me_its_dead, kill_old_master, gtid_migrate):
     """ Promote a new MySQL master
 
     Args:
@@ -68,7 +74,8 @@ def mysql_failover(master, dry_run, skip_lock,
     ignore_dr_slave - Ignore the existance of a dr_slave
     trust_me_its_dead - Do not test to see if the master is dead
     kill_old_master - Send a mysqladmin kill command to the old master
-
+    gtid_migrate - Set this if we're failing over to GTID for the
+                   first time.
     Returns:
     new_master - The new master server
     """
@@ -148,6 +155,14 @@ def mysql_failover(master, dry_run, skip_lock,
         log.info('Preliminary sanity checks complete, starting promotion')
 
         if master_conn:
+            # since the master is alive, we can check for these.
+            errant_trx = mysql_lib.find_errant_trx(slave, master)
+            if errant_trx:
+                log.warning('Errant transactions found!  Repairing via master.')
+                mysql_lib.fix_errant_trx(errant_trx, master, True)
+            else:
+                log.info('No errant transactions detected.')
+
             log.info('Setting read_only on master')
             mysql_lib.set_global_variable(master, 'read_only', True)
             log.info('Confirming no writes to old master')
@@ -164,8 +179,13 @@ def mysql_failover(master, dry_run, skip_lock,
             log.info('Setting up replication from old master ({master}) '
                      'to new master ({slave})'.format(master=master,
                                                       slave=slave))
-            mysql_lib.setup_replication(new_master=slave, new_replica=master)
+            mysql_lib.setup_replication(new_master=slave, new_replica=master,
+                                        auto_pos=(not gtid_migrate))
         else:
+            # if the master is dead, we don't try to fix any errant trx on
+            # the master.  however, we may need to fix them on the dr_slave,
+            # if one exists.
+
             log.info('Starting up a zk connection to make sure we can connect')
             kazoo_client = environment_specific.get_kazoo_client()
             if not kazoo_client:
@@ -197,11 +217,34 @@ def mysql_failover(master, dry_run, skip_lock,
 
     if dr_slave:
         try:
-            mysql_lib.setup_replication(new_master=slave, new_replica=dr_slave)
+            log.info('Disabling super_read_only on the dr_slave')
+            mysql_lib.set_global_variable(dr_slave, 'super_read_only', False, True)
+            mysql_lib.setup_replication(new_master=slave, new_replica=dr_slave,
+                                        auto_pos=(not gtid_migrate))
+            # anything on the slave that the dr_slave still doesn't have?
+            errant_trx = mysql_lib.find_errant_trx(slave, dr_slave)
+            if errant_trx:
+                log.warning("Repairing slave's errant transactions on dr_slave.")
+                mysql_lib.fix_errant_trx(errant_trx, dr_slave, False)
+            else:
+                log.info("No slave -> dr_slave errant trx detected.")
+
+            # what about anything on the dr_slave that the slave doesn't have?
+            errant_trx = mysql_lib.find_errant_trx(dr_slave, slave)
+            if errant_trx:
+                log.warning("Reparing dr_slave errant transactions on slave.")
+                mysql_lib.fix_errant_trx(errant_trx, slave, False)
+            else:
+                log.info("No dr_slave -> slave errant trx detected.")
+
         except Exception as e:
             log.error(e)
             log.error('Setting up replication on the dr_slave failed. '
                       'Failing forward!')
+
+        log.info('Enabling super_read_only on the dr_slave')
+        mysql_lib.set_global_variable(dr_slave, 'super_read_only', True, True)
+
 
     log.info('Updating zk')
     zk_write_attempt = 0
@@ -223,11 +266,15 @@ def mysql_failover(master, dry_run, skip_lock,
     mysql_lib.reset_slave(slave)
     # fence dead server
     if dead_master:
-                # for some weird case when local config file is not
-                # updated with new zk config but the old master is dead
-                # already we simply FORCE-fence it here
+        # for some weird case when local config file is not
+        # updated with new zk config but the old master is dead
+        # already we simply FORCE-fence it here
         fence_server.add_fence_to_host(master, dry_run, force=True)
-          
+    else:
+        # enable super_read_only on the newly-demoted master.
+        log.info('Enabling super_read_only on old master.')
+        mysql_lib.set_global_variable(master, 'super_read_only', True, True)
+
     if lock_identifier:
         log.info('Releasing promotion lock')
         release_promotion_lock(lock_identifier)

@@ -24,7 +24,7 @@ def restart_maxwell_if_not_exists(instance):
     gvars = mysql_lib.get_global_variables(instance)
 
     client_id = gvars['server_uuid']
-    gtid_mode = True if gvars.get('gtid_mode') == 'ON' else False 
+    gtid_mode = True if gvars.get('gtid_mode') == 'ON' else False
     (username, _) = mysql_lib.get_mysql_user_for_role('maxwell')
 
     output_target = 'file'
@@ -47,7 +47,7 @@ def restart_maxwell_if_not_exists(instance):
     try:
         with open(environment_specific.MAXWELL_PID, "r") as f:
             pid = f.read()
-            
+
         proc = psutil.Process(int(pid))
         cmdline = proc.cmdline()
 
@@ -58,13 +58,13 @@ def restart_maxwell_if_not_exists(instance):
         # No PID file or no process matching said PID, so maxwell is definitely
         # not running. If maxwell is a zombie then it's not running either.
         pass
-    
+
     if maxwell_running:
         log.debug('Maxwell is already running')
         return
 
     if instance.hostname_prefix in environment_specific.MAXWELL_TARGET_MAP:
-        host_utils.restart_maxwell(instance.port)
+        host_utils.manage_maxwell(instance.port)
         log.info('Started Maxwell process')
 
 
@@ -81,14 +81,15 @@ def restart_pt_kill_if_not_exists(instance):
     connected_users = mysql_lib.get_connected_users(instance)
     ptkill_user, ptkill_pass = mysql_lib.get_mysql_user_for_role('ptkill')
     if ptkill_user not in connected_users:
-        host_utils.restart_pt_kill(instance.port)
+        host_utils.manage_pt_kill(instance.port)
         log.info('Started Processes ptkill')
 
 
-def restart_pt_heartbeat_if_not_exists(instance):
+def manage_pt_heartbeat(instance):
     """
     Restarts ptheartbeat if it isn't currently running and the
-    replica role type is master
+    replica role type is master, or stop it if it is running on
+    a non-master.
 
     Args:
         instance (host_utils.HostAddr): host to check for ptheartbeat
@@ -103,10 +104,14 @@ def restart_pt_heartbeat_if_not_exists(instance):
     except:
         replica_type = None
     pthb_user, pthb_pass = mysql_lib.get_mysql_user_for_role('ptheartbeat')
-    if replica_type in (host_utils.REPLICA_ROLE_MASTER, None) and \
+    if replica_type == host_utils.REPLICA_ROLE_MASTER and \
             pthb_user not in connected_users:
-        host_utils.restart_pt_heartbeat(instance.port)
-        log.info('Started Processes ptheartbeat')
+        host_utils.manage_pt_heartbeat(instance.port)
+        log.info('Started process pt-heartbeat')
+    elif replica_type != host_utils.REPLICA_ROLE_MASTER and \
+            pthb_user in connected_users:
+        host_utils.manage_pt_heartbeat(instance.port, action='stop')
+        log.info('Stopped pt-heartbeat on non-master replica')
 
 
 def main():
@@ -128,7 +133,7 @@ def main():
         restart_pt_kill_if_not_exists(instance)
 
     if args.action == 'all' or args.action == 'ptheartbeat':
-        restart_pt_heartbeat_if_not_exists(instance)
+        manage_pt_heartbeat(instance)
 
     if args.action == 'all' or args.action == 'maxwell':
         restart_maxwell_if_not_exists(instance)

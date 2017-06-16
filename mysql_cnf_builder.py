@@ -29,7 +29,8 @@ LOG_ROTATE_TEMPLATE = '\n'.join(("{files} {{",
 MYSQLD_SECTION = 'mysqld3306'
 PT_HEARTBEAT_TEMPLATE = 'pt_heartbeat.template'
 PT_HEARTBEAT_CONF_FILE = '/etc/pt-heartbeat-3306.conf'
-PT_KILL_BUSY_TIME = 10
+PT_KILL_DEFAULT_BUSY_TIME = 10
+PT_KILL_PINLATER_BUSY_TIME = 6
 PT_KILL_TEMPLATE = 'pt_kill.template'
 PT_KILL_CONF_FILE = '/etc/pt-kill.conf'
 PT_KILL_IGNORE_USERS = ['admin', 'etl', 'longqueryro', 'longqueryrw',
@@ -475,6 +476,8 @@ def create_pt_kill_conf(override_dir):
         template = f.read()
 
     kill_user, kill_password = mysql_lib.get_mysql_user_for_role('ptkill')
+    busy_time = PT_KILL_PINLATER_BUSY_TIME if 'pinlater' in host_utils.HOSTNAME \
+        else PT_KILL_DEFAULT_BUSY_TIME
 
     if override_dir:
         kill_cnf_path = os.path.join(override_dir, os.path.basename(PT_KILL_CONF_FILE))
@@ -485,7 +488,7 @@ def create_pt_kill_conf(override_dir):
     with open(kill_cnf_path, "w") as kill_cnf_handle:
         kill_cnf_handle.write(template.format(username=kill_user,
                                               password=kill_password,
-                                              busy_time=PT_KILL_BUSY_TIME,
+                                              busy_time=busy_time,
                                               ignore_users='|'.join(PT_KILL_IGNORE_USERS)))
 
 

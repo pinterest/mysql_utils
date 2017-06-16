@@ -42,6 +42,11 @@ def main():
                         help='For standard read or write access, use this '
                              'flag if you expect the query to take more than '
                              '10 seconds.')
+    parser.add_argument('--trust_me_im_a_doctor',
+                        default=False,
+                        action='store_true',
+                        help='If this is set, we bypass any paranoid replica '
+                              'set checks.  User assumes all risk.')
     parser.add_argument('-e',
                         '--execute',
                         help='An optional SQL command to run.',
@@ -106,28 +111,32 @@ def main():
         else:
             raise
 
-    try:
-        # do we need a prompt?
-        if replica_set in environment_specific.EXTRA_PARANOID_REPLICA_SETS:
-            warn = environment_specific.EXTRA_PARANOID_ALERTS.get(replica_set)
-            if args.privileges in ['read-write', 'admin']:
-                resp = raw_input("You've asked for {priv} access to replica "
-                                 "set {rs}.  Are you sure? (Y/N): ".format(
-                                    priv=args.privileges,
-                                    rs=replica_set))
-                if not resp or resp[0] not in ['Y', 'y']:
-                    raise Exception('Connection aborted by user!')
-                else:
-                    print warn
+    if not args.trust_me_im_a_doctor:
+        try:
+            # do we need a prompt?
+            if replica_set in environment_specific.EXTRA_PARANOID_REPLICA_SETS:
+                warn = environment_specific.EXTRA_PARANOID_ALERTS.get(replica_set)
+                if args.privileges in ['read-write', 'admin']:
+                    resp = raw_input("You've asked for {priv} access to replica "
+                                     "set {rs}.  Are you sure? (Y/N): ".format(
+                                        priv=args.privileges,
+                                        rs=replica_set))
+                    if not resp or resp[0] not in ['Y', 'y']:
+                        raise Exception('Connection aborted by user!')
+                    else:
+                        print warn
 
-        # should we enable safe-updates?
-        if replica_set in environment_specific.PARANOID_REPLICA_SETS:
-            if args.privileges in ['read-write', 'admin']:
-                sql_safe = '--init-command="SET SESSION SQL_SAFE_UPDATES=ON"'
+            # should we enable safe-updates?
+            if replica_set in environment_specific.PARANOID_REPLICA_SETS:
+                if args.privileges in ['read-write', 'admin']:
+                    sql_safe = '--init-command="SET SESSION SQL_SAFE_UPDATES=ON"'
 
-    except Exception as e:
-        log.error("Unable to continue: {}".format(e))
-        return
+        except Exception as e:
+            log.error("Unable to continue: {}".format(e))
+            return
+    else:
+        log.warning("OK, we trust you know what you're doing, but "
+                    "don't say we didn't warn you.")
 
     if args.execute:
         execute_escaped = string.replace(args.execute, '"', '\\"')

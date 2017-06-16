@@ -121,7 +121,7 @@ def mysql_init_server(instance,
         mysql_lib.setup_audit_plugin(instance)
 
         log.info('Restarting pt daemons')
-        host_utils.restart_pt_daemons(instance.port)
+        host_utils.manage_pt_daemons(instance.port)
 
         log.info('MySQL initalization complete')
 

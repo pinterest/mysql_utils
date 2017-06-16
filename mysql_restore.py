@@ -226,7 +226,7 @@ def restore_instance(backup_type, restore_source, destination,
             mysql_lib.wait_for_catch_up(destination)
         restore_log_update['replication'] = 'OK'
 
-        host_utils.restart_pt_daemons(destination.port)
+        host_utils.manage_pt_daemons(destination.port)
 
     except Exception as e:
         log.error(e)

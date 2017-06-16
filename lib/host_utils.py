@@ -243,38 +243,39 @@ def tail_mysql_log_for_start_stop(log_error, start_pos=0):
         time.sleep(.5)
 
 
-def restart_pt_daemons(port):
+def manage_pt_daemons(port, action='restart'):
     """ Restart various daemons after a (re)start of MySQL
 
     Args:
-    port - the of the mysql instance on localhost to act on
+        port - the of the mysql instance on localhost to act on
+        action - an optional action other than 'restart'
     """
-    restart_pt_heartbeat(port)
-    restart_pt_kill(port)
+    manage_pt_heartbeat(port, action)
+    manage_pt_kill(port, action)
 
 
-def restart_pt_heartbeat(port):
-    log.info('Restarting pt-heartbeat')
-    cmd = PTHEARTBEAT_CMD.format(port=port, action='restart')
+def manage_pt_heartbeat(port, action='restart'):
+    log.info('{} pt-heartbeat'.format(action))
+    cmd = PTHEARTBEAT_CMD.format(port=port, action=action)
     log.info(cmd)
     (std_out, std_err, return_code) = shell_exec(cmd)
     log.info(std_out.rstrip())
 
 
-def restart_pt_kill(port):
-    log.info('Restart pt-kill')
-    cmd = PTKILL_CMD.format(port=port, action='restart')
+def manage_pt_kill(port, action='restart'):
+    log.info('{} pt-kill'.format(action))
+    cmd = PTKILL_CMD.format(port=port, action=action)
     log.info(cmd)
     (std_out, std_err, return_code) = shell_exec(cmd)
     log.info(std_out.rstrip())
 
 
-def restart_maxwell(port):
-    log.info('Restart Maxwell')
-    cmd = MAXWELL_CMD.format(port=port, action='restart')
+def manage_maxwell(port, action='restart'):
+    log.info('{} Maxwell'.format(action))
+    cmd = MAXWELL_CMD.format(port=port, action=action)
     log.info(cmd)
     (stdout, stderr, return_code) = shell_exec(cmd)
-    if stdout.rstrip(): 
+    if stdout.rstrip():
         log.info(stdout.rstrip())
 
 
@@ -295,7 +296,7 @@ def kill_checksum(instance):
     else:
         log.warning("Checksum got killed !")
     return return_code
-        
+
 
 def upgrade_auth_tables(port):
     """ Run mysql_upgrade

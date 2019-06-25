@@ -1,3 +1,7 @@
+**Note:** This project is no longer actively maintained by Pinterest.
+
+---
+
 # Pinterest MySQL Management Tools
 
 ## NOTE: THESE TOOLS WILL NOT JUST WORK!!!
